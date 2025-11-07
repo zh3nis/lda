@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-@torch.no_grad()
 def classwise_mean_cov(z, y, C, eps=1e-5):
     B, D = z.shape
 
@@ -88,7 +87,35 @@ class LDAHead(nn.Module):
         m2 = (proj * diff).sum(-1)
         return prior.log().unsqueeze(0) - 0.5*m2  # logits
 
+    def joint_nll(self, z, y, update_stats=False):
+        """
+        Supervised joint negative log-likelihood using the current LDA statistics.
+        Mirrors LDAHeadMLE.joint_nll so callers can share the same loss code.
+        """
+        if y is None:
+            raise ValueError("joint_nll requires target labels y.")
 
+        if update_stats and self.training:
+            mu, cov, prior = classwise_mean_cov(z, y, self.C)
+            self._update(mu, cov, prior)
+        else:
+            mu, cov, prior = self.mu_ema, self.cov_ema, self.prior_ema
+
+        precision = self._precision_from_covariance(cov)
+        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        proj = torch.matmul(diff, precision)
+        m2 = (proj * diff).sum(-1)
+
+        sign, logdet = torch.linalg.slogdet(cov)
+        if sign <= 0:
+            raise RuntimeError("Covariance matrix must be positive definite for joint_nll.")
+
+        normalizer = self.D * torch.log(torch.tensor(2.0 * torch.pi, device=z.device, dtype=z.dtype)) + logdet
+        logpdf = -0.5 * (normalizer + m2)
+
+        log_prior = prior.clamp_min(1e-12).log()
+        ll = log_prior[y] + logpdf.gather(1, y.view(-1, 1)).squeeze(1)
+        return -ll.mean()
 
 
 class LDAHeadMLE(nn.Module):
