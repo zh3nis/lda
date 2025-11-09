@@ -1,0 +1,7 @@
+Dataset: fashion_mnist
+Head: softmax
+Encoder: convnet
+Embedding dim: 128
+Best test accuracy: 0.8783
+Final test accuracy: 0.8768
+Final test NLL: 0.3538

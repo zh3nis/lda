@@ -1,0 +1,7 @@
+Dataset: cifar10
+Head: softmax
+Encoder: resnet18
+Embedding dim: 128
+Best test accuracy: 0.9350
+Final test accuracy: 0.9329
+Final test NLL: 0.5661

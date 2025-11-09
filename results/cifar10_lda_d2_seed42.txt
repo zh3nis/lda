@@ -1,0 +1,7 @@
+Dataset: cifar10
+Head: lda
+Encoder: convnet
+Embedding dim: 2
+Best test accuracy: 0.5411
+Final test accuracy: 0.5380
+Final test NLL: 1.2329
