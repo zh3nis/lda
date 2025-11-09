@@ -309,7 +309,7 @@ def main():
     if args.head == 'softmax':
         head = SoftmaxHead(args.embed_dim, num_classes).to(device)
     else:
-        head = TrainableLDAHead(num_classes, args.embed_dim, diag_cov=True).to(device)
+        head = TrainableLDAHead(num_classes, args.embed_dim).to(device)
     
     optimizer = optim.Adam(list(encoder.parameters()) + list(head.parameters()), lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)

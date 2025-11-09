@@ -36,7 +36,7 @@ def classwise_mean_cov(z, y, C, diag_covariance=False, eps=1e-5):
 class LDAHead(nn.Module):
     """Linear Discriminant Analysis classifier with running statistics."""
 
-    def __init__(self, C, D, ema=0.9, diag_cov=False):
+    def __init__(self, C, D, ema=0.9, diag_cov=True):
         super().__init__()
         self.C = C
         self.D = D
@@ -104,7 +104,7 @@ class LDAHead(nn.Module):
 class TrainableLDAHead(nn.Module):
     """LDA-style classifier where the statistics are learned end-to-end."""
 
-    def __init__(self, C, D, eps=1e-4, diag_cov=False):
+    def __init__(self, C, D, eps=1e-4, diag_cov=True):
         super().__init__()
         self.C = C
         self.D = D
