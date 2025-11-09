@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from src.lda import LDAHead
+from src.lda import TrainableLDAHead
 
 
 class ConvEncoder(nn.Module):
@@ -129,9 +129,9 @@ def get_embeddings_2d(model, head, loader, device, num_classes):
     
     # Get class means and covariance if LDA
     class_means = None
-    if isinstance(head, LDAHead):
-        class_means = head.mu_ema.cpu().numpy()
-        cov = head.cov_ema.cpu().numpy()
+    if isinstance(head, TrainableLDAHead):
+        class_means = head.mu.cpu().numpy()
+        cov = head.cov.cpu().numpy()
     else:
         cov = None
     
@@ -309,7 +309,7 @@ def main():
     if args.head == 'softmax':
         head = SoftmaxHead(args.embed_dim, num_classes).to(device)
     else:
-        head = LDAHead(num_classes, args.embed_dim, ema=args.ema).to(device)
+        head = TrainableLDAHead(num_classes, args.embed_dim, diag_cov=True).to(device)
     
     optimizer = optim.Adam(list(encoder.parameters()) + list(head.parameters()), lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
