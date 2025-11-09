@@ -85,3 +85,38 @@ class LDAHead(nn.Module):
         proj = torch.matmul(diff, precision)
         m2 = (proj * diff).sum(-1)
         return prior.log().unsqueeze(0) - 0.5*m2  # logits
+
+
+class TrainableLDAHead(nn.Module):
+    """LDA-style classifier where the statistics are learned end-to-end."""
+
+    def __init__(self, C, D, eps=1e-4):
+        super().__init__()
+        self.C = C
+        self.D = D
+        self.eps = eps
+        self.mu = nn.Parameter(torch.zeros(C, D))
+        self.prior_logits = nn.Parameter(torch.zeros(C))
+        self.precision_factor = nn.Parameter(torch.eye(D))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.mu, mean=0.0, std=1.0)
+        nn.init.zeros_(self.prior_logits)
+        nn.init.eye_(self.precision_factor)
+
+    def _precision(self):
+        # Enforce positive-definiteness via AA^T + eps I.
+        factor = self.precision_factor
+        precision = factor @ factor.transpose(0, 1)
+        precision = 0.5 * (precision + precision.transpose(0, 1))
+        eye = torch.eye(self.D, device=factor.device, dtype=factor.dtype)
+        return precision + self.eps * eye
+
+    def forward(self, z, y=None):
+        prior = torch.softmax(self.prior_logits, dim=0)
+        precision = self._precision()
+        diff = z.unsqueeze(1) - self.mu.unsqueeze(0)
+        proj = torch.matmul(diff, precision)
+        m2 = (proj * diff).sum(-1)
+        return prior.log().unsqueeze(0) - 0.5 * m2
