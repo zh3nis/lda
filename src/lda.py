@@ -1,8 +1,17 @@
 import torch
 import torch.nn as nn
 
-def classwise_mean_cov(z, y, C, diag_covariance=False, eps=1e-5):
+def _validate_covariance_type(covariance_type):
+    if covariance_type not in ('full', 'diag', 'spherical', 'identity'):
+        raise ValueError("covariance_type must be 'full', 'diag', 'spherical', or 'identity'")
+
+
+def classwise_mean_cov(z, y, C, covariance_type='full', eps=1e-5):
     B, D = z.shape
+    _validate_covariance_type(covariance_type)
+    is_diag = covariance_type == 'diag'
+    is_spherical = covariance_type == 'spherical'
+    is_identity = covariance_type == 'identity'
 
     # Build one-hot encodings so we can aggregate per-class statistics.
     y_onehot = torch.zeros(B, C, device=z.device, dtype=z.dtype)
@@ -19,9 +28,16 @@ def classwise_mean_cov(z, y, C, diag_covariance=False, eps=1e-5):
     centered = z.unsqueeze(1) - class_mean.unsqueeze(0)
     centered_masked = centered * y_onehot.unsqueeze(-1)
 
-    if diag_covariance:
+    if is_identity:
+        pooled_cov = torch.ones(D, device=z.device, dtype=z.dtype) + eps
+    elif is_diag or is_spherical:
         class_var = (centered_masked ** 2).sum(dim=0) / class_counts.view(C, 1)
-        pooled_cov = (class_prior.view(C, 1) * class_var).sum(dim=0)
+        pooled_var = (class_prior.view(C, 1) * class_var).sum(dim=0)
+        if is_spherical:
+            scalar = pooled_var.mean()
+            pooled_cov = torch.ones(D, device=z.device, dtype=z.dtype) * scalar
+        else:
+            pooled_cov = pooled_var
         pooled_cov = pooled_cov + eps
     else:
         class_cov = torch.einsum('bcd,bce->cde', centered_masked, centered) / class_counts.view(C, 1, 1)
@@ -36,14 +52,16 @@ def classwise_mean_cov(z, y, C, diag_covariance=False, eps=1e-5):
 class LDAHead(nn.Module):
     """Linear Discriminant Analysis classifier with running statistics."""
 
-    def __init__(self, C, D, ema=0.9, diag_cov=True):
+    def __init__(self, C, D, ema=0.9, covariance_type='spherical'):
         super().__init__()
         self.C = C
         self.D = D
         self.m = ema
-        self.diag_cov = diag_cov
+        _validate_covariance_type(covariance_type)
+        self.covariance_type = covariance_type
+        self._diag_like = covariance_type in ('diag', 'spherical', 'identity')
         self.register_buffer('mu_ema', torch.zeros(C, D))
-        cov_init = torch.ones(D) if diag_cov else torch.eye(D)
+        cov_init = torch.ones(D) if self._diag_like else torch.eye(D)
         self.register_buffer('cov_ema', cov_init)
         self.register_buffer('prior_ema', torch.full((C,), 1.0 / C))
         self.register_buffer('init', torch.tensor(0, dtype=torch.uint8))
@@ -63,7 +81,7 @@ class LDAHead(nn.Module):
         self.prior_ema.mul_(momentum).add_(prior, alpha=1 - momentum)
 
     def _precision_from_covariance(self, cov, eps=1e-6, max_tries=5):
-        if self.diag_cov:
+        if self._diag_like:
             return 1.0 / cov.clamp_min(eps)
 
         # Symmetrize to avoid numerical drift before factorization.
@@ -86,14 +104,14 @@ class LDAHead(nn.Module):
 
     def forward(self, z, y=None):
         if self.training and (y is not None):
-            mu, cov, prior = classwise_mean_cov(z, y, self.C, diag_covariance=self.diag_cov)
+            mu, cov, prior = classwise_mean_cov(z, y, self.C, covariance_type=self.covariance_type)
             self._update(mu, cov, prior)
         else:
             mu, cov, prior = self.mu_ema, self.cov_ema, self.prior_ema
         
         precision = self._precision_from_covariance(cov)
         diff = z.unsqueeze(1) - mu.unsqueeze(0)
-        if self.diag_cov:
+        if self._diag_like:
             proj = diff * precision.view(1, 1, -1)
         else:
             proj = torch.matmul(diff, precision)
@@ -104,16 +122,24 @@ class LDAHead(nn.Module):
 class TrainableLDAHead(nn.Module):
     """LDA-style classifier where the statistics are learned end-to-end."""
 
-    def __init__(self, C, D, eps=1e-4, diag_cov=True):
+    def __init__(self, C, D, eps=1e-4, covariance_type='spherical'):
         super().__init__()
         self.C = C
         self.D = D
         self.eps = eps
-        self.diag_cov = diag_cov
+        _validate_covariance_type(covariance_type)
+        self.covariance_type = covariance_type
+        self._diag_like = covariance_type in ('diag', 'spherical', 'identity')
+        self._spherical = covariance_type == 'spherical'
+        self._identity = covariance_type == 'identity'
         self.mu = nn.Parameter(torch.zeros(C, D))
         self.prior_logits = nn.Parameter(torch.zeros(C))
-        if diag_cov:
-            self.log_precision = nn.Parameter(torch.zeros(D))
+        if self._identity:
+            self.register_parameter('log_precision', None)
+            self.register_parameter('precision_factor', None)
+        elif self._diag_like:
+            size = 1 if self._spherical else D
+            self.log_precision = nn.Parameter(torch.zeros(size))
             self.register_parameter('precision_factor', None)
         else:
             self.precision_factor = nn.Parameter(torch.eye(D))
@@ -123,15 +149,23 @@ class TrainableLDAHead(nn.Module):
     def reset_parameters(self):
         nn.init.normal_(self.mu, mean=0.0, std=1.0)
         nn.init.zeros_(self.prior_logits)
-        if self.diag_cov:
+        if self._identity:
+            pass
+        elif self._diag_like:
             nn.init.zeros_(self.log_precision)
         else:
             nn.init.eye_(self.precision_factor)
 
     def _precision(self):
-        if self.diag_cov:
-            # Parameterize diagonal precision in log-space for stability.
-            return torch.exp(self.log_precision) + self.eps
+        if self._identity:
+            return torch.ones(self.D, device=self.mu.device, dtype=self.mu.dtype)
+
+        if self._diag_like:
+            # Parameterize diagonal/spherical precision in log-space for stability.
+            precision = torch.exp(self.log_precision) + self.eps
+            if self._spherical:
+                return precision.expand(self.D)
+            return precision
 
         # Enforce positive-definiteness via AA^T + eps I.
         factor = self.precision_factor
@@ -144,7 +178,7 @@ class TrainableLDAHead(nn.Module):
         prior = torch.softmax(self.prior_logits, dim=0)
         precision = self._precision()
         diff = z.unsqueeze(1) - self.mu.unsqueeze(0)
-        if self.diag_cov:
+        if self._diag_like:
             proj = diff * precision.view(1, 1, -1)
         else:
             proj = torch.matmul(diff, precision)

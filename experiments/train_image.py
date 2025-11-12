@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from src.lda import TrainableLDAHead
+from src.lda import LDAHead, TrainableLDAHead
 
 
 class ConvEncoder(nn.Module):
@@ -129,7 +129,10 @@ def get_embeddings_2d(model, head, loader, device, num_classes):
     
     # Get class means and covariance if LDA
     class_means = None
-    if isinstance(head, TrainableLDAHead):
+    if isinstance(head, LDAHead):
+        class_means = head.mu_ema.cpu().numpy()
+        cov = head.cov_ema.cpu().numpy()
+    elif isinstance(head, TrainableLDAHead):
         class_means = head.mu.cpu().numpy()
         cov = head.cov.cpu().numpy()
     else:
@@ -216,7 +219,7 @@ def plot_training_curves(history, dataset, head, encoder, embed_dim, seed):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, required=True, choices=['fashion_mnist', 'cifar10'])
-    parser.add_argument('--head', type=str, required=True, choices=['softmax', 'lda'])
+    parser.add_argument('--head', type=str, required=True, choices=['softmax', 'lda', 'trainable_lda'])
     parser.add_argument('--embed_dim', type=int, default=128)
     parser.add_argument('--encoder', type=str, default='convnet', choices=['convnet', 'resnet18'])
     parser.add_argument('--epochs', type=int, default=100)
@@ -308,6 +311,8 @@ def main():
     
     if args.head == 'softmax':
         head = SoftmaxHead(args.embed_dim, num_classes).to(device)
+    elif args.head == 'lda':
+        head = LDAHead(num_classes, args.embed_dim, ema=args.ema).to(device)
     else:
         head = TrainableLDAHead(num_classes, args.embed_dim).to(device)
     
