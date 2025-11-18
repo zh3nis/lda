@@ -6,7 +6,7 @@ def _validate_covariance_type(covariance_type):
         raise ValueError("covariance_type must be 'full', 'diag', 'spherical', or 'identity'")
 
 
-def classwise_mean_cov(z, y, C, covariance_type='full', eps=1e-5):
+def classwise_mean_cov(z, y, C, covariance_type='spherical', eps=1e-6):
     B, D = z.shape
     _validate_covariance_type(covariance_type)
     is_diag = covariance_type == 'diag'
@@ -29,7 +29,7 @@ def classwise_mean_cov(z, y, C, covariance_type='full', eps=1e-5):
     centered_masked = centered * y_onehot.unsqueeze(-1)
 
     if is_identity:
-        pooled_cov = torch.ones(D, device=z.device, dtype=z.dtype) + eps
+        pooled_cov = torch.ones(D, device=z.device, dtype=z.dtype)
     elif is_diag or is_spherical:
         class_var = (centered_masked ** 2).sum(dim=0) / class_counts.view(C, 1)
         pooled_var = (class_prior.view(C, 1) * class_var).sum(dim=0)
@@ -48,6 +48,7 @@ def classwise_mean_cov(z, y, C, covariance_type='full', eps=1e-5):
         pooled_cov = pooled_cov + torch.eye(D, device=z.device, dtype=z.dtype) * eps
 
     return class_mean, pooled_cov, class_prior
+
 
 class LDAHead(nn.Module):
     """Linear Discriminant Analysis classifier with running statistics."""
@@ -117,70 +118,3 @@ class LDAHead(nn.Module):
             proj = torch.matmul(diff, precision)
         m2 = (proj * diff).sum(-1)
         return prior.log().unsqueeze(0) - 0.5*m2  # logits
-
-
-class TrainableLDAHead(nn.Module):
-    """LDA-style classifier where the statistics are learned end-to-end."""
-
-    def __init__(self, C, D, eps=1e-4, covariance_type='spherical'):
-        super().__init__()
-        self.C = C
-        self.D = D
-        self.eps = eps
-        _validate_covariance_type(covariance_type)
-        self.covariance_type = covariance_type
-        self._diag_like = covariance_type in ('diag', 'spherical', 'identity')
-        self._spherical = covariance_type == 'spherical'
-        self._identity = covariance_type == 'identity'
-        self.mu = nn.Parameter(torch.zeros(C, D))
-        self.prior_logits = nn.Parameter(torch.zeros(C))
-        if self._identity:
-            self.register_parameter('log_precision', None)
-            self.register_parameter('precision_factor', None)
-        elif self._diag_like:
-            size = 1 if self._spherical else D
-            self.log_precision = nn.Parameter(torch.zeros(size))
-            self.register_parameter('precision_factor', None)
-        else:
-            self.precision_factor = nn.Parameter(torch.eye(D))
-            self.register_parameter('log_precision', None)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.normal_(self.mu, mean=0.0, std=1.0)
-        nn.init.zeros_(self.prior_logits)
-        if self._identity:
-            pass
-        elif self._diag_like:
-            nn.init.zeros_(self.log_precision)
-        else:
-            nn.init.eye_(self.precision_factor)
-
-    def _precision(self):
-        if self._identity:
-            return torch.ones(self.D, device=self.mu.device, dtype=self.mu.dtype)
-
-        if self._diag_like:
-            # Parameterize diagonal/spherical precision in log-space for stability.
-            precision = torch.exp(self.log_precision) + self.eps
-            if self._spherical:
-                return precision.expand(self.D)
-            return precision
-
-        # Enforce positive-definiteness via AA^T + eps I.
-        factor = self.precision_factor
-        precision = factor @ factor.transpose(0, 1)
-        precision = 0.5 * (precision + precision.transpose(0, 1))
-        eye = torch.eye(self.D, device=factor.device, dtype=factor.dtype)
-        return precision + self.eps * eye
-
-    def forward(self, z, y=None):
-        prior = torch.softmax(self.prior_logits, dim=0)
-        precision = self._precision()
-        diff = z.unsqueeze(1) - self.mu.unsqueeze(0)
-        if self._diag_like:
-            proj = diff * precision.view(1, 1, -1)
-        else:
-            proj = torch.matmul(diff, precision)
-        m2 = (proj * diff).sum(-1)
-        return prior.log().unsqueeze(0) - 0.5 * m2

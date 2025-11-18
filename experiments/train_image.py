@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from src.lda import LDAHead, TrainableLDAHead
+from src.lda import LDAHead
 
 
 class ConvEncoder(nn.Module):
@@ -132,9 +132,6 @@ def get_embeddings_2d(model, head, loader, device, num_classes):
     if isinstance(head, LDAHead):
         class_means = head.mu_ema.cpu().numpy()
         cov = head.cov_ema.cpu().numpy()
-    elif isinstance(head, TrainableLDAHead):
-        class_means = head.mu.cpu().numpy()
-        cov = head.cov.cpu().numpy()
     else:
         cov = None
     
@@ -219,13 +216,20 @@ def plot_training_curves(history, dataset, head, encoder, embed_dim, seed):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, required=True, choices=['fashion_mnist', 'cifar10'])
-    parser.add_argument('--head', type=str, required=True, choices=['softmax', 'lda', 'trainable_lda'])
-    parser.add_argument('--embed_dim', type=int, default=128)
+    parser.add_argument('--head', type=str, required=True, choices=['softmax', 'lda'])
+    parser.add_argument('--embed_dim', type=int, default=9)
     parser.add_argument('--encoder', type=str, default='convnet', choices=['convnet', 'resnet18'])
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--ema', type=float, default=0.9)
+    parser.add_argument(
+        '--lda_covariance',
+        type=str,
+        default='spherical',
+        choices=['full', 'diag', 'spherical', 'identity'],
+        help='Covariance type for the running-statistics LDA head'
+    )
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--save_dir', type=str, default='results')
     parser.add_argument('--debug', action='store_true', help='Fast debug mode: 5 epochs, subset of data')
@@ -311,10 +315,13 @@ def main():
     
     if args.head == 'softmax':
         head = SoftmaxHead(args.embed_dim, num_classes).to(device)
-    elif args.head == 'lda':
-        head = LDAHead(num_classes, args.embed_dim, ema=args.ema).to(device)
     else:
-        head = TrainableLDAHead(num_classes, args.embed_dim).to(device)
+        head = LDAHead(
+            num_classes,
+            args.embed_dim,
+            ema=args.ema,
+            covariance_type=args.lda_covariance
+        ).to(device)
     
     optimizer = optim.Adam(list(encoder.parameters()) + list(head.parameters()), lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
