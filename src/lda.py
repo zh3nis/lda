@@ -35,8 +35,7 @@ class LDAHead(nn.Module):
             simplex = torch.cat([simplex, pad], dim=1)
         return simplex
 
-    def forward(self, z, y=None):
-        del y  # interface compatibility
+    def forward(self, z):
         mu = self.mu.to(z.dtype)
         diff = z.unsqueeze(1) - mu.unsqueeze(0)
         m2 = (diff * diff).sum(-1)
