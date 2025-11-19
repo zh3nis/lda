@@ -1,120 +1,44 @@
+import math
 import torch
 import torch.nn as nn
 
-def _validate_covariance_type(covariance_type):
-    if covariance_type not in ('full', 'diag', 'spherical', 'identity'):
-        raise ValueError("covariance_type must be 'full', 'diag', 'spherical', or 'identity'")
-
-
-def classwise_mean_cov(z, y, C, covariance_type='spherical', eps=1e-6):
-    B, D = z.shape
-    _validate_covariance_type(covariance_type)
-    is_diag = covariance_type == 'diag'
-    is_spherical = covariance_type == 'spherical'
-    is_identity = covariance_type == 'identity'
-
-    # Build one-hot encodings so we can aggregate per-class statistics.
-    y_onehot = torch.zeros(B, C, device=z.device, dtype=z.dtype)
-    y_onehot.scatter_(1, y.view(-1, 1), 1.0)
-
-    class_counts = y_onehot.sum(dim=0) + eps
-    class_prior = (class_counts / class_counts.sum()).to(z.dtype)
-
-    # Mean of embeddings for each class.
-    class_sums = y_onehot.t() @ z
-    class_mean = class_sums / class_counts.unsqueeze(1)
-
-    # Covariance of each class (center, mask unrelated examples, then accumulate).
-    centered = z.unsqueeze(1) - class_mean.unsqueeze(0)
-    centered_masked = centered * y_onehot.unsqueeze(-1)
-
-    if is_identity:
-        pooled_cov = torch.ones(D, device=z.device, dtype=z.dtype)
-    elif is_diag or is_spherical:
-        class_var = (centered_masked ** 2).sum(dim=0) / class_counts.view(C, 1)
-        pooled_var = (class_prior.view(C, 1) * class_var).sum(dim=0)
-        if is_spherical:
-            scalar = pooled_var.mean()
-            pooled_cov = torch.ones(D, device=z.device, dtype=z.dtype) * scalar
-        else:
-            pooled_cov = pooled_var
-        pooled_cov = pooled_cov + eps
-    else:
-        class_cov = torch.einsum('bcd,bce->cde', centered_masked, centered) / class_counts.view(C, 1, 1)
-
-        # Pooled covariance weighted by class prior.
-        pooled_cov = (class_prior.view(C, 1, 1) * class_cov).sum(dim=0)
-        pooled_cov = 0.5 * (pooled_cov + pooled_cov.transpose(0, 1))
-        pooled_cov = pooled_cov + torch.eye(D, device=z.device, dtype=z.dtype) * eps
-
-    return class_mean, pooled_cov, class_prior
-
 
 class LDAHead(nn.Module):
-    """Linear Discriminant Analysis classifier with running statistics."""
+    """Fixed-mean LDA classifier with identity covariance and trainable priors."""
 
-    def __init__(self, C, D, ema=0.9, covariance_type='spherical'):
+    def __init__(self, C, D):
         super().__init__()
+        if D < C - 1:
+            raise ValueError(f"D must be at least C-1 to embed the simplex (got C={C}, D={D}).")
         self.C = C
         self.D = D
-        self.m = ema
-        _validate_covariance_type(covariance_type)
-        self.covariance_type = covariance_type
-        self._diag_like = covariance_type in ('diag', 'spherical', 'identity')
-        self.register_buffer('mu_ema', torch.zeros(C, D))
-        cov_init = torch.ones(D) if self._diag_like else torch.eye(D)
-        self.register_buffer('cov_ema', cov_init)
-        self.register_buffer('prior_ema', torch.full((C,), 1.0 / C))
-        self.register_buffer('init', torch.tensor(0, dtype=torch.uint8))
+        dtype = torch.get_default_dtype()
+        mu = self._regular_simplex_vertices(C, D, dtype=dtype)
+        pairwise_dist = math.sqrt(2.0 * C / (C - 1))
+        scale = 4.0 / pairwise_dist
+        mu = mu * scale
+        self.register_buffer('mu', mu)
+        self.register_buffer('cov_diag', torch.ones(D, dtype=dtype))
+        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
 
-    @torch.no_grad()
-    def _update(self, mu, cov, prior):
-        if not bool(self.init.item()):
-            self.mu_ema.copy_(mu)
-            self.cov_ema.copy_(cov)
-            self.prior_ema.copy_(prior)
-            self.init.fill_(1)
-            return
-
-        momentum = self.m
-        self.mu_ema.mul_(momentum).add_(mu, alpha=1 - momentum)
-        self.cov_ema.mul_(momentum).add_(cov, alpha=1 - momentum)
-        self.prior_ema.mul_(momentum).add_(prior, alpha=1 - momentum)
-
-    def _precision_from_covariance(self, cov, eps=1e-6, max_tries=5):
-        if self._diag_like:
-            return 1.0 / cov.clamp_min(eps)
-
-        # Symmetrize to avoid numerical drift before factorization.
-        cov = 0.5 * (cov + cov.transpose(0, 1))
-        try:
-            chol = torch.linalg.cholesky(cov)
-            return torch.cholesky_inverse(chol)
-        except RuntimeError:
-            eye = torch.eye(self.D, device=cov.device, dtype=cov.dtype)
-            jitter = eps
-            for _ in range(max_tries):
-                cov_jitter = cov + jitter * eye
-                try:
-                    chol = torch.linalg.cholesky(cov_jitter)
-                    return torch.cholesky_inverse(chol)
-                except RuntimeError:
-                    jitter *= 10.0
-        # Fallback to pseudo-inverse if Cholesky keeps failing.
-        return torch.linalg.pinv(cov)
+    @staticmethod
+    def _regular_simplex_vertices(C, D, dtype):
+        """Construct vertices of a regular simplex centered at the origin."""
+        eye = torch.eye(C, dtype=dtype)
+        centered = eye - eye.mean(dim=0, keepdim=True)
+        _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+        basis = vh.transpose(-2, -1)[:, :C - 1]
+        simplex = centered @ basis
+        simplex = simplex / simplex.norm(dim=1, keepdim=True)
+        if D > C - 1:
+            pad = torch.zeros(C, D - (C - 1), dtype=dtype)
+            simplex = torch.cat([simplex, pad], dim=1)
+        return simplex
 
     def forward(self, z, y=None):
-        if self.training and (y is not None):
-            mu, cov, prior = classwise_mean_cov(z, y, self.C, covariance_type=self.covariance_type)
-            self._update(mu, cov, prior)
-        else:
-            mu, cov, prior = self.mu_ema, self.cov_ema, self.prior_ema
-        
-        precision = self._precision_from_covariance(cov)
+        del y  # interface compatibility
+        mu = self.mu.to(z.dtype)
         diff = z.unsqueeze(1) - mu.unsqueeze(0)
-        if self._diag_like:
-            proj = diff * precision.view(1, 1, -1)
-        else:
-            proj = torch.matmul(diff, precision)
-        m2 = (proj * diff).sum(-1)
-        return prior.log().unsqueeze(0) - 0.5*m2  # logits
+        m2 = (diff * diff).sum(-1)
+        log_prior = torch.log_softmax(self.prior_logits, dim=0)
+        return log_prior.unsqueeze(0) - 0.5 * m2
