@@ -30,3 +30,4 @@ data/cifar-100-python/meta
 data/cifar-100-python/test
 data/cifar-100-python/train
 src/lda_old.py
+cifar100_model.pth
