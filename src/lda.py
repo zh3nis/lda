@@ -54,6 +54,39 @@ class LDAHead(nn.Module):
 
 
 
+class TrainableLDAHead(nn.Module):
+    """LDA classifier with trainable class means, spherical covariance, and trainable priors."""
+
+    def __init__(self, C, D):
+        super().__init__()
+        if D < C - 1:
+            raise ValueError(f"D must be at least C-1 to embed the simplex (got C={C}, D={D}).")
+        self.C = C
+        self.D = D
+        dtype = torch.get_default_dtype()
+        mu = LDAHead._regular_simplex_vertices(C, D, dtype=dtype)
+        pairwise_dist = math.sqrt(2.0 * C / (C - 1))
+        scale = 6.0 / pairwise_dist
+        self.mu = nn.Parameter(mu * scale)
+        self.log_cov = nn.Parameter(torch.zeros(1, dtype=dtype))
+        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
+
+    @property
+    def cov_diag(self):
+        return torch.exp(self.log_cov).repeat(self.D)
+
+    def forward(self, z):
+        mu = self.mu.to(z.dtype)
+        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        m2 = (diff * diff).sum(-1)
+        log_cov = self.log_cov.to(z.dtype)
+        var = torch.exp(log_cov)
+        log_det = self.D * log_cov
+        log_prior = torch.log_softmax(self.prior_logits, dim=0)
+        return log_prior.unsqueeze(0) - 0.5 * (m2 / var + log_det)
+
+
+
 class _GenericLoss(nn.Module):
     def __init__(self, ignore_index=-100, reduction="elementwise_mean"):
         assert reduction in ["elementwise_mean", "sum", "none"]
