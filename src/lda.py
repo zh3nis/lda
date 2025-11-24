@@ -59,15 +59,11 @@ class TrainableLDAHead(nn.Module):
 
     def __init__(self, C, D):
         super().__init__()
-        if D < C - 1:
-            raise ValueError(f"D must be at least C-1 to embed the simplex (got C={C}, D={D}).")
         self.C = C
         self.D = D
         dtype = torch.get_default_dtype()
-        mu = LDAHead._regular_simplex_vertices(C, D, dtype=dtype)
-        pairwise_dist = math.sqrt(2.0 * C / (C - 1))
-        scale = 6.0 / pairwise_dist
-        self.mu = nn.Parameter(mu * scale)
+        # Start class means from a normal distribution instead of a fixed simplex layout.
+        self.mu = nn.Parameter(torch.randn(C, D, dtype=dtype) * 6.0 / math.sqrt(2*D))
         self.log_cov = nn.Parameter(torch.zeros(1, dtype=dtype))
         self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
 
