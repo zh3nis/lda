@@ -54,6 +54,165 @@ class LDAHead(nn.Module):
 
 
 
+class LowRankSimplexLDAHead(nn.Module):
+    """
+    Fixed-mean LDA head that uses a best rank-D approximation of the simplex
+    when the embedding dimension is smaller than C-1. Means stay fixed; only
+    the spherical covariance and priors are trainable.
+    """
+
+    def __init__(self, C, D, target_pairwise_distance=6.0, eps=1e-12):
+        super().__init__()
+        if D < 1:
+            raise ValueError(f"D must be positive (got C={C}, D={D}).")
+        self.C = C
+        self.D = D
+        self.target_pairwise_distance = target_pairwise_distance
+        self.eps = eps
+        dtype = torch.get_default_dtype()
+        mu = self._approximate_simplex_vertices(C, D, dtype=dtype, target_pairwise_distance=target_pairwise_distance, eps=eps)
+        self.register_buffer('mu', mu)
+        self.log_cov = nn.Parameter(torch.zeros(1, dtype=dtype))
+        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
+
+    @staticmethod
+    def _approximate_simplex_vertices(C, D, dtype, target_pairwise_distance, eps):
+        """Create simplex vertices and project to D dims via best rank-D truncation if needed."""
+        # Build a (C-1)-simplex centered at the origin.
+        eye = torch.eye(C, dtype=dtype)
+        centered = eye - eye.mean(dim=0, keepdim=True)
+        _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+        basis = vh.transpose(-2, -1)[:, :C - 1]
+        simplex_full = centered @ basis
+        simplex_full = simplex_full / simplex_full.norm(dim=1, keepdim=True)
+
+        if D < C - 1:
+            # Best rank-D approximation via truncated SVD (Eckart–Young).
+            u, s, _ = torch.linalg.svd(simplex_full, full_matrices=False)
+            mu = u[:, :D] * s[:D]
+        else:
+            mu = simplex_full
+
+        if D > mu.shape[1]:
+            pad = torch.zeros(C, D - mu.shape[1], dtype=dtype)
+            mu = torch.cat([mu, pad], dim=1)
+
+        # Rescale so the average pairwise distance matches the target.
+        pdist = torch.pdist(mu)
+        mean_dist = pdist.mean().clamp_min(eps)
+        scale = target_pairwise_distance / mean_dist
+        return mu * scale
+
+    @property
+    def cov_diag(self):
+        """Return diagonal of the spherical covariance matrix."""
+        return torch.exp(self.log_cov).repeat(self.D)
+
+    def forward(self, z):
+        mu = self.mu.to(z.dtype)
+        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        m2 = (diff * diff).sum(-1)
+        var = torch.exp(self.log_cov).to(z.dtype)
+        log_det = self.D * self.log_cov.to(z.dtype)
+        log_prior = torch.log_softmax(self.prior_logits, dim=0)
+        return log_prior.unsqueeze(0) - 0.5 * (m2 / var + log_det)
+
+
+
+class FisherLDAHead(nn.Module):
+    """
+    Fixed-mean spherical LDA head trained with Fisher's discriminant criterion.
+
+    Forward returns the negative Fisher ratio for a labeled batch. Use `logits`
+    for evaluation-time class logits identical to LDAHead.
+    """
+
+    def __init__(self, C, D, fisher_eps=1e-8, prior_strength=0.5):
+        super().__init__()
+        if D < C - 1:
+            raise ValueError(f"D must be at least C-1 to embed the simplex (got C={C}, D={D}).")
+        if not (0.0 <= prior_strength <= 1.0):
+            raise ValueError(f"prior_strength must be in [0,1] (got {prior_strength}).")
+        self.C = C
+        self.D = D
+        self.fisher_eps = fisher_eps
+        self.prior_strength = prior_strength
+        dtype = torch.get_default_dtype()
+        mu = self._regular_simplex_vertices(C, D, dtype=dtype)
+        pairwise_dist = math.sqrt(2.0 * C / (C - 1))
+        scale = 6.0 / pairwise_dist
+        mu = mu * scale
+        self.register_buffer('mu', mu)
+        self.log_cov = nn.Parameter(torch.zeros(1, dtype=dtype))
+        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
+
+    @staticmethod
+    def _regular_simplex_vertices(C, D, dtype):
+        eye = torch.eye(C, dtype=dtype)
+        centered = eye - eye.mean(dim=0, keepdim=True)
+        _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+        basis = vh.transpose(-2, -1)[:, :C - 1]
+        simplex = centered @ basis
+        simplex = simplex / simplex.norm(dim=1, keepdim=True)
+        if D > C - 1:
+            pad = torch.zeros(C, D - (C - 1), dtype=dtype)
+            simplex = torch.cat([simplex, pad], dim=1)
+        return simplex
+
+    @property
+    def cov_diag(self):
+        return torch.exp(self.log_cov).repeat(self.D)
+
+    def logits(self, z):
+        """Compute LDA logits for evaluation (same form as LDAHead.forward)."""
+        mu = self.mu.to(z.dtype)
+        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        m2 = (diff * diff).sum(-1)
+        var = torch.exp(self.log_cov).to(z.dtype)
+        log_det = self.D * self.log_cov.to(z.dtype)
+        log_prior = torch.log_softmax(self.prior_logits, dim=0)
+        return log_prior.unsqueeze(0) - 0.5 * (m2 / var + log_det)
+
+    def forward(self, z, y):
+        """
+        Return negative Fisher ratio for the batch.
+
+        z: (B, D) embeddings
+        y: (B,) labels in [0, C)
+        """
+        if y is None:
+            raise ValueError("Labels y must be provided to compute the Fisher criterion.")
+        if y.dim() != 1:
+            raise ValueError(f"Expected y to be 1D (got shape {tuple(y.shape)}).")
+        if z.shape[0] != y.shape[0]:
+            raise ValueError(f"Mismatched batch sizes: z has {z.shape[0]}, y has {y.shape[0]}.")
+
+        dtype = z.dtype
+        device = z.device
+        mu = self.mu.to(device=device, dtype=dtype)
+        var = torch.exp(self.log_cov.to(device=device, dtype=dtype))
+
+        # Within-class scatter measured by Mahalanobis distance to fixed class means.
+        diff = z - mu[y]
+        within = (diff.pow(2).sum(dim=1) / var).mean()
+
+        # Between-class scatter of the fixed means around their prior-weighted centroid.
+        counts = torch.bincount(y, minlength=self.C).to(device=device, dtype=dtype)
+        total = counts.sum().clamp_min(1.0)
+        data_pi = counts / total
+        learned_pi = torch.softmax(self.prior_logits.to(device=device, dtype=dtype), dim=0)
+        pi = self.prior_strength * learned_pi + (1.0 - self.prior_strength) * data_pi
+
+        overall_mu = (pi.unsqueeze(1) * mu).sum(dim=0)
+        centered = mu - overall_mu
+        between_per_class = centered.pow(2).sum(dim=1) / var
+        between = (pi * between_per_class).sum()
+
+        fisher_ratio = between / (within + self.fisher_eps)
+        return -fisher_ratio
+
+
+
 class TrainableLDAHead(nn.Module):
     """LDA classifier with trainable class means, spherical covariance, and trainable priors."""
 
@@ -81,6 +240,227 @@ class TrainableLDAHead(nn.Module):
         log_prior = torch.log_softmax(self.prior_logits, dim=0)
         return log_prior.unsqueeze(0) - 0.5 * (m2 / var + log_det)
 
+
+
+class FullCovLDAHead(nn.Module):
+    """LDA classifier with trainable means, full shared covariance, and trainable priors."""
+
+    def __init__(self, C, D, min_scale=1e-4):
+        super().__init__()
+        if D < 1:
+            raise ValueError(f"D must be positive (got D={D}).")
+        self.C = C
+        self.D = D
+        self.min_scale = min_scale
+        dtype = torch.get_default_dtype()
+        self.mu = nn.Parameter(torch.zeros(C, D, dtype=dtype))
+        self.raw_tril = nn.Parameter(torch.zeros(D, D, dtype=dtype))
+        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
+
+    def _get_cholesky(self, dtype, device):
+        raw = torch.tril(self.raw_tril.to(device=device, dtype=dtype))
+        diag = torch.diagonal(raw, 0)
+        safe_diag = F.softplus(diag) + self.min_scale
+        L = raw - torch.diag(diag) + torch.diag(safe_diag)
+        return L
+
+    @property
+    def covariance(self):
+        """Full covariance matrix Sigma = L L^T."""
+        L = self._get_cholesky(self.raw_tril.dtype, self.raw_tril.device)
+        return L @ L.transpose(-2, -1)
+
+    def forward(self, z):
+        dtype = z.dtype
+        device = z.device
+        mu = self.mu.to(device=device, dtype=dtype)
+        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        L = self._get_cholesky(dtype, device)
+        diff_flat = diff.reshape(-1, self.D).transpose(0, 1)
+        solved = torch.linalg.solve_triangular(L, diff_flat, upper=False)
+        m2 = (solved * solved).sum(dim=0).reshape(z.shape[0], self.C)
+        log_det = 2.0 * torch.log(torch.diagonal(L)).sum()
+        log_prior = torch.log_softmax(self.prior_logits.to(device=device, dtype=dtype), dim=0)
+        return log_prior.unsqueeze(0) - 0.5 * (m2 + log_det)
+
+
+class FisherFullCovLDAHead(nn.Module):
+    """
+    Full-covariance LDA head trained via Fisher's discriminant criterion.
+
+    Forward returns a scalar loss (-Fisher ratio) that pushes class means apart
+    relative to the shared covariance using the current batch. Use `logits(z)`
+    to obtain class logits identical to FullCovLDAHead for evaluation.
+    """
+
+    def __init__(self, C, D, min_scale=1e-4, fisher_eps=1e-8, prior_strength=0.5):
+        super().__init__()
+        if D < 1:
+            raise ValueError(f"D must be positive (got D={D}).")
+        if not (0.0 <= prior_strength <= 1.0):
+            raise ValueError(f"prior_strength must be in [0,1] (got {prior_strength}).")
+        self.C = C
+        self.D = D
+        self.min_scale = min_scale
+        self.fisher_eps = fisher_eps
+        self.prior_strength = prior_strength
+        dtype = torch.get_default_dtype()
+        self.mu = nn.Parameter(torch.zeros(C, D, dtype=dtype))
+        self.raw_tril = nn.Parameter(torch.zeros(D, D, dtype=dtype))
+        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
+
+    def _get_cholesky(self, dtype, device):
+        raw = torch.tril(self.raw_tril.to(device=device, dtype=dtype))
+        diag = torch.diagonal(raw, 0)
+        safe_diag = F.softplus(diag) + self.min_scale
+        L = raw - torch.diag(diag) + torch.diag(safe_diag)
+        return L
+
+    def logits(self, z):
+        """Compute class logits (same form as FullCovLDAHead) for evaluation."""
+        dtype = z.dtype
+        device = z.device
+        mu = self.mu.to(device=device, dtype=dtype)
+        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        L = self._get_cholesky(dtype, device)
+        diff_flat = diff.reshape(-1, self.D).transpose(0, 1)
+        solved = torch.linalg.solve_triangular(L, diff_flat, upper=False)
+        m2 = (solved * solved).sum(dim=0).reshape(z.shape[0], self.C)
+        log_det = 2.0 * torch.log(torch.diagonal(L)).sum()
+        log_prior = torch.log_softmax(self.prior_logits.to(device=device, dtype=dtype), dim=0)
+        return log_prior.unsqueeze(0) - 0.5 * (m2 + log_det)
+
+    def forward(self, z, y):
+        """
+        Return negative Fisher ratio for the batch.
+
+        z: (B, D) embeddings
+        y: (B,) labels in [0, C)
+        """
+        if y is None:
+            raise ValueError("Labels y must be provided to compute the Fisher criterion.")
+        if y.dim() != 1:
+            raise ValueError(f"Expected y to be 1D (got shape {tuple(y.shape)}).")
+        if z.shape[0] != y.shape[0]:
+            raise ValueError(f"Mismatched batch sizes: z has {z.shape[0]}, y has {y.shape[0]}.")
+
+        dtype = z.dtype
+        device = z.device
+        mu = self.mu.to(device=device, dtype=dtype)
+        L = self._get_cholesky(dtype, device)
+
+        # Within-class scatter measured by Mahalanobis distance to the class mean.
+        diff = z - mu[y]
+        diff_flat = diff.transpose(0, 1)
+        solved = torch.linalg.solve_triangular(L, diff_flat, upper=False)
+        within = (solved * solved).sum(dim=0).mean()
+
+        # Between-class scatter: weighted spread of class means around the global mean.
+        counts = torch.bincount(y, minlength=self.C).to(device=device, dtype=dtype)
+        total = counts.sum().clamp_min(1.0)
+        data_pi = counts / total
+        learned_pi = torch.softmax(self.prior_logits.to(device=device, dtype=dtype), dim=0)
+        pi = self.prior_strength * learned_pi + (1.0 - self.prior_strength) * data_pi
+
+        overall_mu = (pi.unsqueeze(1) * mu).sum(dim=0)
+        centered = mu - overall_mu
+        centered_flat = centered.transpose(0, 1)
+        centered_solved = torch.linalg.solve_triangular(L, centered_flat, upper=False)
+        between_per_class = (centered_solved * centered_solved).sum(dim=0)
+        between = (pi * between_per_class).sum()
+
+        fisher_ratio = between / (within + self.fisher_eps)
+        return -fisher_ratio
+
+
+class BatchwiseFullCovLDAHead(nn.Module):
+    """
+    LDA head that re-estimates priors/means/shared covariance on each batch and
+    maintains an EMA of those estimates. Only the encoder is trained; the head
+    parameters are treated as plug-in statistics.
+    """
+
+    def __init__(self, C, D, ema_beta=0.9, min_scale=1e-4, prior_floor=1e-6):
+        super().__init__()
+        if D < 1:
+            raise ValueError(f"D must be positive (got D={D}).")
+        if not (0.0 <= ema_beta < 1.0):
+            raise ValueError(f"ema_beta must be in [0,1) (got {ema_beta}).")
+        self.C = C
+        self.D = D
+        self.ema_beta = ema_beta
+        self.min_scale = min_scale
+        self.prior_floor = prior_floor
+        dtype = torch.get_default_dtype()
+        self.register_buffer("ema_pi", torch.full((C,), 1.0 / C, dtype=dtype))
+        self.register_buffer("ema_mu", torch.zeros(C, D, dtype=dtype))
+        self.register_buffer("ema_cov", torch.eye(D, dtype=dtype))
+
+    @torch.no_grad()
+    def _reestimate_from_batch(self, z, y):
+        """
+        Re-estimate pi, mu, Sigma from a labeled batch and update EMA buffers.
+        """
+        if y is None:
+            raise ValueError("Labels y must be provided during training for batchwise re-estimation.")
+        if y.dim() != 1:
+            raise ValueError(f"Expected y to be 1D (got shape {tuple(y.shape)}).")
+        if z.shape[0] != y.shape[0]:
+            raise ValueError(f"Mismatched batch sizes: z has {z.shape[0]}, y has {y.shape[0]}.")
+
+        device = z.device
+        dtype = z.dtype
+        m = float(z.shape[0])
+        one_hot = F.one_hot(y, num_classes=self.C).to(dtype=dtype)
+        counts = one_hot.sum(dim=0)  # (C,)
+        pi_hat = counts / m
+
+        sum_z = one_hot.transpose(0, 1) @ z  # (C, D)
+        safe_counts = counts.clamp_min(1.0).unsqueeze(1)
+        mu_hat = sum_z / safe_counts
+
+        # For classes absent in the batch, keep previous means to avoid dividing by zero noise.
+        present = counts > 0
+        mu_hat = torch.where(present.unsqueeze(1), mu_hat, self.ema_mu.to(device=device, dtype=dtype))
+
+        # Shared covariance across all classes.
+        mu_per_sample = mu_hat[y]
+        diff = z - mu_per_sample
+        cov_hat = (diff.transpose(0, 1) @ diff) / m
+        cov_hat = cov_hat + torch.eye(self.D, device=device, dtype=dtype) * self.min_scale
+
+        beta = self.ema_beta
+        pi_tilde = beta * self.ema_pi.to(device=device, dtype=dtype) + (1.0 - beta) * pi_hat
+        mu_tilde = beta * self.ema_mu.to(device=device, dtype=dtype) + (1.0 - beta) * mu_hat
+        cov_tilde = beta * self.ema_cov.to(device=device, dtype=dtype) + (1.0 - beta) * cov_hat
+
+        self.ema_pi.copy_(pi_tilde)
+        self.ema_mu.copy_(mu_tilde)
+        self.ema_cov.copy_(cov_tilde)
+
+    def forward(self, z, y=None):
+        device = z.device
+        dtype = z.dtype
+        if self.training:
+            self._reestimate_from_batch(z.detach(), y.detach() if y is not None else None)
+
+        pi = self.ema_pi.to(device=device, dtype=dtype)
+        mu = self.ema_mu.to(device=device, dtype=dtype)
+        cov = self.ema_cov.to(device=device, dtype=dtype)
+
+        # Compute log likelihoods under N(mu_c, cov) with a shared covariance.
+        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        # Add a small diagonal in case cov drifts toward singular.
+        cov_safe = cov + torch.eye(self.D, device=device, dtype=dtype) * self.min_scale
+        L = torch.linalg.cholesky(cov_safe)
+        diff_flat = diff.reshape(-1, self.D).transpose(0, 1)
+        solved = torch.linalg.solve_triangular(L, diff_flat, upper=False)
+        m2 = (solved * solved).sum(dim=0).reshape(z.shape[0], self.C)
+        log_det = 2.0 * torch.log(torch.diagonal(L)).sum()
+
+        pi_safe = torch.clamp(pi, min=self.prior_floor)
+        log_prior = torch.log(pi_safe)
+        return log_prior.unsqueeze(0) - 0.5 * (m2 + log_det)
 
 
 class _GenericLoss(nn.Module):
