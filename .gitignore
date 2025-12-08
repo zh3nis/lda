@@ -35,3 +35,4 @@ cifar100_fisher_model.pth
 data/ptb/ptb.test.txt
 data/ptb/ptb.train.txt
 data/ptb/ptb.valid.txt
+__pycache__/CIFAR100_LatentDimSweep.cpython-312.pyc

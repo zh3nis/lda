@@ -53,72 +53,6 @@ class LDAHead(nn.Module):
         return log_prior.unsqueeze(0) - 0.5 * (m2 / var + log_det)
 
 
-
-class LowRankSimplexLDAHead(nn.Module):
-    """
-    Fixed-mean LDA head that uses a best rank-D approximation of the simplex
-    when the embedding dimension is smaller than C-1. Means stay fixed; only
-    the spherical covariance and priors are trainable.
-    """
-
-    def __init__(self, C, D, target_pairwise_distance=6.0, eps=1e-12):
-        super().__init__()
-        if D < 1:
-            raise ValueError(f"D must be positive (got C={C}, D={D}).")
-        self.C = C
-        self.D = D
-        self.target_pairwise_distance = target_pairwise_distance
-        self.eps = eps
-        dtype = torch.get_default_dtype()
-        mu = self._approximate_simplex_vertices(C, D, dtype=dtype, target_pairwise_distance=target_pairwise_distance, eps=eps)
-        self.register_buffer('mu', mu)
-        self.log_cov = nn.Parameter(torch.zeros(1, dtype=dtype))
-        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
-
-    @staticmethod
-    def _approximate_simplex_vertices(C, D, dtype, target_pairwise_distance, eps):
-        """Create simplex vertices and project to D dims via best rank-D truncation if needed."""
-        # Build a (C-1)-simplex centered at the origin.
-        eye = torch.eye(C, dtype=dtype)
-        centered = eye - eye.mean(dim=0, keepdim=True)
-        _, _, vh = torch.linalg.svd(centered, full_matrices=False)
-        basis = vh.transpose(-2, -1)[:, :C - 1]
-        simplex_full = centered @ basis
-        simplex_full = simplex_full / simplex_full.norm(dim=1, keepdim=True)
-
-        if D < C - 1:
-            # Best rank-D approximation via truncated SVD (Eckart–Young).
-            u, s, _ = torch.linalg.svd(simplex_full, full_matrices=False)
-            mu = u[:, :D] * s[:D]
-        else:
-            mu = simplex_full
-
-        if D > mu.shape[1]:
-            pad = torch.zeros(C, D - mu.shape[1], dtype=dtype)
-            mu = torch.cat([mu, pad], dim=1)
-
-        # Rescale so the average pairwise distance matches the target.
-        pdist = torch.pdist(mu)
-        mean_dist = pdist.mean().clamp_min(eps)
-        scale = target_pairwise_distance / mean_dist
-        return mu * scale
-
-    @property
-    def cov_diag(self):
-        """Return diagonal of the spherical covariance matrix."""
-        return torch.exp(self.log_cov).repeat(self.D)
-
-    def forward(self, z):
-        mu = self.mu.to(z.dtype)
-        diff = z.unsqueeze(1) - mu.unsqueeze(0)
-        m2 = (diff * diff).sum(-1)
-        var = torch.exp(self.log_cov).to(z.dtype)
-        log_det = self.D * self.log_cov.to(z.dtype)
-        log_prior = torch.log_softmax(self.prior_logits, dim=0)
-        return log_prior.unsqueeze(0) - 0.5 * (m2 / var + log_det)
-
-
-
 class FisherLDAHead(nn.Module):
     """
     Fixed-mean spherical LDA head trained with Fisher's discriminant criterion.
@@ -223,6 +157,7 @@ class TrainableLDAHead(nn.Module):
         dtype = torch.get_default_dtype()
         # Start class means from a normal distribution instead of a fixed simplex layout.
         self.mu = nn.Parameter(torch.randn(C, D, dtype=dtype) * 6.0 / math.sqrt(2*D))
+        #self.mu = nn.Parameter(torch.zeros(C, D, dtype=dtype))
         self.log_cov = nn.Parameter(torch.zeros(1, dtype=dtype))
         self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
 
@@ -254,6 +189,7 @@ class FullCovLDAHead(nn.Module):
         self.min_scale = min_scale
         dtype = torch.get_default_dtype()
         self.mu = nn.Parameter(torch.zeros(C, D, dtype=dtype))
+        #self.mu = nn.Parameter(torch.randn(C, D, dtype=dtype) * 6.0 / math.sqrt(2*D))
         self.raw_tril = nn.Parameter(torch.zeros(D, D, dtype=dtype))
         self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
 
@@ -521,3 +457,67 @@ class LDALoss(_GenericLoss):
 
     def loss(self, X, target):
         return lda_loss(X, target)
+
+
+
+def dnll_loss(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    lambda_reg: float = 1.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    r"""
+    DNLL: Discriminative Negative Log-Likelihood
+
+        L(x, y) = -input_y(x) + λ * sum_c exp(input_c(x))
+
+    Applicable to any generative classifier with class-wise
+    (unnormalized) log-density or log-joint scores.
+
+    Args:
+        input:  Tensor (N, C) of class scores δ_c(x).
+        target: LongTensor (N,) with class indices in [0, C-1].
+        lambda_reg: float ≥ 0, strength of discriminative penalty.
+        reduction: "none" | "mean" | "sum".
+
+    Returns:
+        Loss reduced according to `reduction`.
+    """
+    # NLL part: -δ_y(x)
+    nll = -input.gather(1, target.unsqueeze(1)).squeeze(1)  # (N,)
+
+    # Discriminative penalty: λ * ∑_c exp(δ_c(x))
+    reg = lambda_reg * input.exp().sum(dim=1)               # (N,)
+
+    loss = nll + reg                                        # (N,)
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    elif reduction == "none":
+        return loss
+    else:
+        raise ValueError(f"Invalid reduction: {reduction}")
+
+class DNLLLoss(nn.Module):
+    r"""
+    DNLL: Discriminative Negative Log-Likelihood
+
+        L(x, y) = -input_y(x) + λ * sum_c exp(input_c(x))
+
+    A drop-in loss module similar to nn.CrossEntropyLoss, but designed
+    for generative classifiers whose outputs are log-density scores.
+    """
+    def __init__(self, lambda_reg: float = 1.0, reduction: str = "mean"):
+        super().__init__()
+        self.lambda_reg = float(lambda_reg)
+        self.reduction = reduction
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return dnll_loss(
+            input=input,
+            target=target,
+            lambda_reg=self.lambda_reg,
+            reduction=self.reduction,
+        )
