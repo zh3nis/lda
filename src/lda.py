@@ -521,3 +521,56 @@ class DNLLLoss(nn.Module):
             lambda_reg=self.lambda_reg,
             reduction=self.reduction,
         )
+
+
+def logistic_loss(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    r"""
+    One-vs-all logistic loss over all classes.
+
+        L(x, y) = -log σ(δ_y(x)) - ∑_{c≠y} log σ(-δ_c(x))
+
+    Equivalent to summing binary cross-entropy terms for each class with a
+    one-hot target.
+
+    Args:
+        input:  Tensor (N, C) of class scores δ_c(x).
+        target: LongTensor (N,) with class indices in [0, C-1].
+        reduction: "none" | "mean" | "sum".
+
+    Returns:
+        Loss reduced according to `reduction`.
+    """
+    one_hot = F.one_hot(target, num_classes=input.shape[1]).type_as(input)  # (N, C)
+    per_class = F.binary_cross_entropy_with_logits(input, one_hot, reduction="none")  # (N, C)
+    loss = per_class.sum(dim=1)  # (N,)
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    elif reduction == "none":
+        return loss
+    else:
+        raise ValueError(f"Invalid reduction: {reduction}")
+
+
+class LogisticLoss(nn.Module):
+    r"""
+    One-vs-all logistic loss over all classes.
+
+        L(x, y) = -log σ(δ_y(x)) - ∑_{c≠y} log σ(-δ_c(x))
+    """
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return logistic_loss(
+            input=input,
+            target=target,
+            reduction=self.reduction,
+        )
