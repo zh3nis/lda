@@ -176,6 +176,68 @@ class TrainableLDAHead(nn.Module):
         return log_prior.unsqueeze(0) - 0.5 * (m2 / var + log_det)
 
 
+class TrainableMDAHead(nn.Module):
+    """MDA classifier with per-class Gaussian mixtures and shared spherical covariance."""
+
+    def __init__(self, C, D, K=2):
+        super().__init__()
+        if K < 1:
+            raise ValueError(f"K must be positive (got K={K}).")
+        self.C = C
+        self.D = D
+        self.K = K
+        dtype = torch.get_default_dtype()
+        scale = 6.0 / math.sqrt(2 * D)
+        self.mu = nn.Parameter(torch.randn(C, K, D, dtype=dtype) * scale)
+        self.log_cov = nn.Parameter(torch.zeros(1, dtype=dtype))
+        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
+        self.mix_logits = nn.Parameter(torch.zeros(C, K, dtype=dtype))
+
+    @property
+    def cov_diag(self):
+        return torch.exp(self.log_cov).repeat(self.D)
+
+    def forward(self, z):
+        mu = self.mu.to(z.dtype)
+        diff = z.unsqueeze(1).unsqueeze(1) - mu.unsqueeze(0)
+        m2 = (diff * diff).sum(-1)
+        log_cov = self.log_cov.to(z.dtype)
+        var = torch.exp(log_cov)
+        log_det = self.D * log_cov
+        log_prior = torch.log_softmax(self.prior_logits, dim=0)
+        log_mix = torch.log_softmax(self.mix_logits, dim=1)
+        log_comp = log_mix.unsqueeze(0) - 0.5 * (m2 / var + log_det)
+        log_like = torch.logsumexp(log_comp, dim=2)
+        return log_prior.unsqueeze(0) + log_like
+
+
+class DiagTrainableLDAHead(nn.Module):
+    """LDA classifier with trainable means, diagonal covariance, and trainable priors."""
+
+    def __init__(self, C, D):
+        super().__init__()
+        self.C = C
+        self.D = D
+        dtype = torch.get_default_dtype()
+        # Start class means from a normal distribution instead of a fixed simplex layout.
+        self.mu = nn.Parameter(torch.randn(C, D, dtype=dtype) * 6.0 / math.sqrt(2*D))
+        self.log_cov_diag = nn.Parameter(torch.zeros(D, dtype=dtype))
+        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
+
+    @property
+    def cov_diag(self):
+        return torch.exp(self.log_cov_diag)
+
+    def forward(self, z):
+        mu = self.mu.to(z.dtype)
+        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        log_cov_diag = self.log_cov_diag.to(z.dtype)
+        var = torch.exp(log_cov_diag)
+        m2 = (diff * diff / var).sum(-1)
+        log_det = log_cov_diag.sum()
+        log_prior = torch.log_softmax(self.prior_logits, dim=0)
+        return log_prior.unsqueeze(0) - 0.5 * (m2 + log_det)
+
 
 class FullCovLDAHead(nn.Module):
     """LDA classifier with trainable means, full shared covariance, and trainable priors."""
