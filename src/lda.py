@@ -148,32 +148,115 @@ class FisherLDAHead(nn.Module):
 
 
 class TrainableLDAHead(nn.Module):
-    """LDA classifier with trainable class means, spherical covariance, and trainable priors."""
+    """LDA classifier with trainable class means, configurable covariance, and trainable priors.
+    
+    Args:
+        C: Number of classes
+        D: Embedding dimension
+        cov_type: Type of covariance ('spherical', 'diagonal', or 'full')
+        min_scale: Minimum scale for numerical stability (used in full covariance)
+    """
 
-    def __init__(self, C, D):
+    def __init__(self, C, D, cov_type='spherical', min_scale=1e-4):
         super().__init__()
+        if cov_type not in ['spherical', 'diagonal', 'full']:
+            raise ValueError(f"cov_type must be 'spherical', 'diagonal', or 'full' (got '{cov_type}')")
         self.C = C
         self.D = D
+        self.cov_type = cov_type
+        self.min_scale = min_scale
         dtype = torch.get_default_dtype()
-        # Start class means from a normal distribution instead of a fixed simplex layout.
+        
+        # Start class means from a normal distribution
         self.mu = nn.Parameter(torch.randn(C, D, dtype=dtype) * 6.0 / math.sqrt(2*D))
-        #self.mu = nn.Parameter(torch.zeros(C, D, dtype=dtype))
-        self.log_cov = nn.Parameter(torch.zeros(1, dtype=dtype))
+        
+        # Initialize covariance parameters based on type
+        if cov_type == 'spherical':
+            # Single scalar for all dimensions
+            self.log_cov = nn.Parameter(torch.zeros(1, dtype=dtype))
+        elif cov_type == 'diagonal':
+            # One parameter per dimension
+            self.log_cov = nn.Parameter(torch.zeros(D, dtype=dtype))
+        else:  # full
+            # Lower triangular matrix for Cholesky decomposition
+            self.raw_tril = nn.Parameter(torch.zeros(D, D, dtype=dtype))
+        
         self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
+
+    def _get_cholesky(self, dtype, device):
+        """Get Cholesky factor for full covariance."""
+        raw = torch.tril(self.raw_tril.to(device=device, dtype=dtype))
+        diag = torch.diagonal(raw, 0)
+        safe_diag = F.softplus(diag) + self.min_scale
+        L = raw - torch.diag(diag) + torch.diag(safe_diag)
+        return L
 
     @property
     def cov_diag(self):
-        return torch.exp(self.log_cov).repeat(self.D)
+        """Return diagonal of the covariance matrix."""
+        if self.cov_type == 'spherical':
+            return torch.exp(self.log_cov).repeat(self.D)
+        elif self.cov_type == 'diagonal':
+            return torch.exp(self.log_cov)
+        else:  # full
+            L = self._get_cholesky(self.raw_tril.dtype, self.raw_tril.device)
+            cov = L @ L.transpose(-2, -1)
+            return torch.diagonal(cov, 0)
+
+    @property
+    def covariance(self):
+        """Return full covariance matrix."""
+        if self.cov_type == 'spherical':
+            var = torch.exp(self.log_cov).item()
+            return torch.eye(self.D, device=self.log_cov.device) * var
+        elif self.cov_type == 'diagonal':
+            return torch.diag(torch.exp(self.log_cov))
+        else:  # full
+            L = self._get_cholesky(self.raw_tril.dtype, self.raw_tril.device)
+            return L @ L.transpose(-2, -1)
 
     def forward(self, z):
         mu = self.mu.to(z.dtype)
         diff = z.unsqueeze(1) - mu.unsqueeze(0)
-        m2 = (diff * diff).sum(-1)
-        log_cov = self.log_cov.to(z.dtype)
-        var = torch.exp(log_cov)
-        log_det = self.D * log_cov
-        log_prior = torch.log_softmax(self.prior_logits, dim=0)
-        return log_prior.unsqueeze(0) - 0.5 * (m2 / var + log_det)
+        
+        if self.cov_type == 'spherical':
+            # Spherical covariance: sigma^2 * I
+            m2 = (diff * diff).sum(-1)
+            log_cov = self.log_cov.to(z.dtype)
+            var = torch.exp(log_cov)
+            log_det = self.D * log_cov
+            log_prior = torch.log_softmax(self.prior_logits, dim=0)
+            return log_prior.unsqueeze(0) - 0.5 * (m2 / var + log_det)
+            
+        elif self.cov_type == 'diagonal':
+            # Diagonal covariance: diag(sigma_1^2, ..., sigma_D^2)
+            log_cov = self.log_cov.to(z.dtype)
+            var = torch.exp(log_cov)
+            m2 = (diff * diff / var.unsqueeze(0).unsqueeze(0)).sum(-1)
+            log_det = log_cov.sum()
+            log_prior = torch.log_softmax(self.prior_logits, dim=0)
+            return log_prior.unsqueeze(0) - 0.5 * (m2 + log_det)
+            
+        else:  # full
+            # Full covariance using Cholesky decomposition
+            dtype = z.dtype
+            device = z.device
+            L = self._get_cholesky(dtype, device)
+            
+            # Optimized Mahalanobis distance computation
+            eye = torch.eye(self.D, device=device, dtype=dtype)
+            L_inv = torch.linalg.solve_triangular(L, eye, upper=False)
+            
+            z_prime = z @ L_inv.T
+            mu_prime = mu @ L_inv.T
+            
+            z_sq = z_prime.pow(2).sum(dim=1, keepdim=True)
+            mu_sq = mu_prime.pow(2).sum(dim=1, keepdim=True).T
+            m2 = z_sq + mu_sq - 2 * (z_prime @ mu_prime.T)
+            
+            log_det = 2.0 * torch.log(torch.diagonal(L)).sum()
+            log_prior = torch.log_softmax(self.prior_logits.to(device=device, dtype=dtype), dim=0)
+            return log_prior.unsqueeze(0) - 0.5 * (m2 + log_det)
 
 
 
@@ -210,11 +293,20 @@ class FullCovLDAHead(nn.Module):
         dtype = z.dtype
         device = z.device
         mu = self.mu.to(device=device, dtype=dtype)
-        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        
         L = self._get_cholesky(dtype, device)
-        diff_flat = diff.reshape(-1, self.D).transpose(0, 1)
-        solved = torch.linalg.solve_triangular(L, diff_flat, upper=False)
-        m2 = (solved * solved).sum(dim=0).reshape(z.shape[0], self.C)
+        
+        # Optimized Mahalanobis distance computation
+        eye = torch.eye(self.D, device=device, dtype=dtype)
+        L_inv = torch.linalg.solve_triangular(L, eye, upper=False)
+        
+        z_prime = z @ L_inv.T
+        mu_prime = mu @ L_inv.T
+        
+        z_sq = z_prime.pow(2).sum(dim=1, keepdim=True)
+        mu_sq = mu_prime.pow(2).sum(dim=1, keepdim=True).T
+        m2 = z_sq + mu_sq - 2 * (z_prime @ mu_prime.T)
+        
         log_det = 2.0 * torch.log(torch.diagonal(L)).sum()
         log_prior = torch.log_softmax(self.prior_logits.to(device=device, dtype=dtype), dim=0)
         return log_prior.unsqueeze(0) - 0.5 * (m2 + log_det)
