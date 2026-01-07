@@ -37,3 +37,5 @@ data/ptb/ptb.train.txt
 data/ptb/ptb.valid.txt
 __pycache__
 data
+*.tex
+*.bib
