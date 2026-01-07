@@ -235,10 +235,10 @@ def plot_classification_results(results_root: str, out_path: str = None, models:
     Args:
         results_root: Directory containing dataset folders with seed_* subdirs
         out_path: Output path for the plot (default: results_root/results.png)
-        models: List of model names to plot (default: softmax, simplex_lda, trainable_lda)
+        models: List of model names to plot (default: softmax, simplex_lda, trainable_lda, trainable_lda_spherical)
     """
     if models is None:
-        models = ["softmax", "simplex_lda", "trainable_lda"]
+        models = ["softmax", "simplex_lda", "trainable_lda", "trainable_lda_spherical"]
     if out_path is None:
         out_path = os.path.join(results_root, "results.png")
 
@@ -254,8 +254,8 @@ def plot_classification_results(results_root: str, out_path: str = None, models:
     if n_datasets == 1:
         axes = axes.reshape(2, 1)
 
-    colors = {"softmax": "C0", "simplex_lda": "C1", "trainable_lda": "C2"}
-    linestyles = {"softmax": "-", "simplex_lda": "--", "trainable_lda": "-."}
+    colors = {"softmax": "C0", "simplex_lda": "C1", "trainable_lda": "C2", "trainable_lda_spherical": "C3"}
+    linestyles = {"softmax": "-", "simplex_lda": "--", "trainable_lda": "-.", "trainable_lda_spherical": ":"}
 
     for idx, dataset in enumerate(datasets):
         ds_dir = os.path.join(results_root, dataset)
@@ -332,7 +332,7 @@ def plot_segmentation_results(results_root: str, out_path: str = None, models: L
         models: List of model names to plot
     """
     if models is None:
-        models = ["softmax", "simplex_lda", "trainable_lda"]
+        models = ["softmax", "simplex_lda", "trainable_lda", "trainable_lda_spherical"]
 
     datasets = [d for d in os.listdir(results_root) if os.path.isdir(os.path.join(results_root, d))]
     datasets.sort()
@@ -341,8 +341,8 @@ def plot_segmentation_results(results_root: str, out_path: str = None, models: L
         print(f"No datasets found in {results_root}")
         return
 
-    colors = {"softmax": "C0", "simplex_lda": "C1", "trainable_lda": "C2"}
-    linestyles = {"softmax": "-", "simplex_lda": "--", "trainable_lda": "-."}
+    colors = {"softmax": "C0", "simplex_lda": "C1", "trainable_lda": "C2", "trainable_lda_spherical": "C3"}
+    linestyles = {"softmax": "-", "simplex_lda": "--", "trainable_lda": "-.", "trainable_lda_spherical": ":"}
 
     for dataset in datasets:
         ds_dir = os.path.join(results_root, dataset)
@@ -515,7 +515,7 @@ def save_segmentation_comparison_plot(
 def plot_tabular_results(results_root: str, out_path: str = None, models: List[str] = None):
     """Plot tabular classification results with confidence intervals."""
     if models is None:
-        models = ["softmax", "simplex_lda", "trainable_lda"]
+        models = ["softmax", "simplex_lda", "trainable_lda", "trainable_lda_spherical"]
     if out_path is None:
         out_path = os.path.join(results_root, "results.png")
 
@@ -529,8 +529,8 @@ def plot_tabular_results(results_root: str, out_path: str = None, models: List[s
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-    colors = {"softmax": "C0", "simplex_lda": "C1", "trainable_lda": "C2"}
-    linestyles = {"softmax": "-", "simplex_lda": "--", "trainable_lda": "-."}
+    colors = {"softmax": "C0", "simplex_lda": "C1", "trainable_lda": "C2", "trainable_lda_spherical": "C3"}
+    linestyles = {"softmax": "-", "simplex_lda": "--", "trainable_lda": "-.", "trainable_lda_spherical": ":"}
 
     for idx, dataset in enumerate(datasets):
         ds_dir = os.path.join(results_root, dataset)
@@ -561,7 +561,12 @@ def plot_tabular_results(results_root: str, out_path: str = None, models: List[s
             stacked[m]["train"] = np.array(stacked[m]["train"])
             stacked[m]["test"] = np.array(stacked[m]["test"])
 
-        x = np.arange(1, epochs + 1)
+        # Use actual data length instead of epochs from JSON
+        first_model = next((m for m in models if stacked[m]["train"].size > 0), None)
+        if first_model is None:
+            continue
+        actual_epochs = stacked[first_model]["train"].shape[1]
+        x = np.arange(1, actual_epochs + 1)
 
         # Train accuracy
         ax = axes[0]

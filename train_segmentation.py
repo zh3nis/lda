@@ -33,7 +33,9 @@ from torchvision.transforms import InterpolationMode
 from src.lda import DNLLLoss
 from models import (
     SoftmaxSegmentation, SimplexLDASegmentation, TrainableLDASegmentation,
+    TrainableLDASphericalSegmentation,
     SoftmaxFCNSegmentation, SimplexLDAFCNSegmentation, TrainableLDAFCNSegmentation,
+    TrainableLDASphericalFCNSegmentation,
 )
 from utils import (
     seed_all,
@@ -389,6 +391,11 @@ def run_experiment(args):
     print(f"Dataset: {name}, Classes: {C}, Input channels: {in_ch}")
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
+    # Select models to train
+    all_models = ["softmax", "simplex_lda", "trainable_lda", "trainable_lda_spherical"]
+    models_to_train = args.models if args.models else all_models
+    print(f"Models to train: {models_to_train}")
+
     for seed in args.seeds:
         seed_all(seed)
         seed_dir = os.path.join(results_root, name, f"seed_{seed}")
@@ -396,98 +403,97 @@ def run_experiment(args):
         models_dir = os.path.join(seed_dir, "models")
         os.makedirs(models_dir, exist_ok=True)
 
-        softmax_path = os.path.join(models_dir, "softmax.pth")
-        simplex_path = os.path.join(models_dir, "simplex_lda.pth")
-        trainable_path = os.path.join(models_dir, "trainable_lda.pth")
         out_path = os.path.join(seed_dir, "metrics_history.json")
 
-        models_exist = all(os.path.exists(p) for p in [softmax_path, simplex_path, trainable_path])
-        training_cached = os.path.exists(out_path) and not args.overwrite
-
-        if training_cached:
-            print(f"\n=== {name} | seed={seed} (cached) ===")
+        # Load existing history if exists
+        if os.path.exists(out_path):
+            import json
+            with open(out_path) as f:
+                existing_data = json.load(f)
+            hist = existing_data.get("history", {})
         else:
-            print(f"\n=== {name} | seed={seed} ===")
+            hist = {}
 
-        # Build models - use simple FCN for Indian Pines, UNet for others
+        print(f"\n=== {name} | seed={seed} ===")
+
+        ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_idx).to(device)
+        dnll_wrapped = SegmentationLossWrapper(DNLLLoss(lambda_reg=1.0), ignore_index=ignore_idx).to(device)
+
+        # Model configs based on dataset type
         if args.dataset == "IndianPines":
-            softmax_model = SoftmaxFCNSegmentation(in_ch, C, base_ch=args.base_channels).to(device)
-            simplex_model = SimplexLDAFCNSegmentation(in_ch, C, base_ch=args.base_channels).to(device)
-            trainable_model = TrainableLDAFCNSegmentation(in_ch, C, base_ch=args.base_channels).to(device)
+            model_configs = {
+                "softmax": (SoftmaxFCNSegmentation, ce_loss),
+                "simplex_lda": (SimplexLDAFCNSegmentation, dnll_wrapped),
+                "trainable_lda": (TrainableLDAFCNSegmentation, dnll_wrapped),
+                "trainable_lda_spherical": (TrainableLDASphericalFCNSegmentation, dnll_wrapped),
+            }
         else:
-            softmax_model = SoftmaxSegmentation(in_ch, C, base_ch=args.base_channels).to(device)
-            simplex_model = SimplexLDASegmentation(in_ch, C, base_ch=args.base_channels).to(device)
-            trainable_model = TrainableLDASegmentation(in_ch, C, base_ch=args.base_channels).to(device)
-
-        if (models_exist or training_cached) and not args.overwrite:
-            print("Loading cached models...")
-            softmax_model.load_state_dict(torch.load(softmax_path, map_location=device))
-            simplex_model.load_state_dict(torch.load(simplex_path, map_location=device))
-            trainable_model.load_state_dict(torch.load(trainable_path, map_location=device))
-        else:
-            # Train models
-            opt_soft = torch.optim.Adam(softmax_model.parameters(), lr=args.lr)
-            opt_simp = torch.optim.Adam(simplex_model.parameters(), lr=args.lr)
-            opt_trn = torch.optim.Adam(trainable_model.parameters(), lr=args.lr)
-
-            ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_idx).to(device)
-            dnll_wrapped = SegmentationLossWrapper(DNLLLoss(lambda_reg=1.0), ignore_index=ignore_idx).to(device)
-
-            hist = {
-                "softmax": {"train_acc": [], "train_miou": [], "val_acc": [], "val_miou": []},
-                "simplex_lda": {"train_acc": [], "train_miou": [], "val_acc": [], "val_miou": []},
-                "trainable_lda": {"train_acc": [], "train_miou": [], "val_acc": [], "val_miou": []},
+            model_configs = {
+                "softmax": (SoftmaxSegmentation, ce_loss),
+                "simplex_lda": (SimplexLDASegmentation, dnll_wrapped),
+                "trainable_lda": (TrainableLDASegmentation, dnll_wrapped),
+                "trainable_lda_spherical": (TrainableLDASphericalSegmentation, dnll_wrapped),
             }
 
+        trained_models = {}
+        for model_name in models_to_train:
+            if model_name not in model_configs:
+                print(f"Unknown model: {model_name}")
+                continue
+
+            model_path = os.path.join(models_dir, f"{model_name}.pth")
+
+            # Skip if already trained and not overwriting
+            if model_name in hist and os.path.exists(model_path) and not args.overwrite:
+                print(f"  Skipping {model_name} (cached)")
+                model_cls, _ = model_configs[model_name]
+                model = model_cls(in_ch, C, base_ch=args.base_channels).to(device)
+                model.load_state_dict(torch.load(model_path, map_location=device))
+                trained_models[model_name] = model
+                continue
+
+            model_cls, loss_fn = model_configs[model_name]
+            model = model_cls(in_ch, C, base_ch=args.base_channels).to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+            hist[model_name] = {"train_acc": [], "train_miou": [], "val_acc": [], "val_miou": []}
+
             for epoch in range(1, args.epochs + 1):
-                # Train
-                tr_soft = train_segmentation_epoch(softmax_model, train_loader, opt_soft, ce_loss, device, C, ignore_idx)
-                val_soft = evaluate_segmentation(softmax_model, val_loader, device, C, ignore_idx)
+                tr = train_segmentation_epoch(model, train_loader, optimizer, loss_fn, device, C, ignore_idx)
+                val = evaluate_segmentation(model, val_loader, device, C, ignore_idx)
 
-                tr_simp = train_segmentation_epoch(simplex_model, train_loader, opt_simp, dnll_wrapped, device, C, ignore_idx)
-                val_simp = evaluate_segmentation(simplex_model, val_loader, device, C, ignore_idx)
+                hist[model_name]["train_acc"].append(tr["acc"])
+                hist[model_name]["train_miou"].append(tr["miou"])
+                hist[model_name]["val_acc"].append(val["acc"])
+                hist[model_name]["val_miou"].append(val["miou"])
 
-                tr_trn = train_segmentation_epoch(trainable_model, train_loader, opt_trn, dnll_wrapped, device, C, ignore_idx)
-                val_trn = evaluate_segmentation(trainable_model, val_loader, device, C, ignore_idx)
+                if epoch % 10 == 0 or epoch == args.epochs:
+                    print(f"  [{model_name}] Epoch {epoch:02d}: train_miou={tr['miou']:.3f} val_miou={val['miou']:.3f}")
 
-                # Record
-                for model_name, tr, val in [("softmax", tr_soft, val_soft),
-                                             ("simplex_lda", tr_simp, val_simp),
-                                             ("trainable_lda", tr_trn, val_trn)]:
-                    hist[model_name]["train_acc"].append(tr["acc"])
-                    hist[model_name]["train_miou"].append(tr["miou"])
-                    hist[model_name]["val_acc"].append(val["acc"])
-                    hist[model_name]["val_miou"].append(val["miou"])
+            # Save model
+            torch.save(model.state_dict(), model_path)
+            trained_models[model_name] = model
 
-                print(
-                    f"[Epoch {epoch:02d}] "
-                    f"Softmax tr={tr_soft['miou']:.3f} val={val_soft['miou']:.3f} | "
-                    f"Simplex tr={tr_simp['miou']:.3f} val={val_simp['miou']:.3f} | "
-                    f"Trainable tr={tr_trn['miou']:.3f} val={val_trn['miou']:.3f}"
-                )
-
-            save_json(out_path, {
-                "seed": seed,
-                "epochs": args.epochs,
-                "history": hist,
-                "dataset": name,
-                "timestamp": time.time(),
-            })
-            print(f"Saved {out_path}")
-
-            # Save models
-            torch.save(softmax_model.state_dict(), softmax_path)
-            torch.save(simplex_model.state_dict(), simplex_path)
-            torch.save(trainable_model.state_dict(), trainable_path)
-            print(f"Saved models to {models_dir}")
+        # Save history
+        save_json(out_path, {
+            "seed": seed,
+            "epochs": args.epochs,
+            "history": hist,
+            "dataset": name,
+        })
+        print(f"Saved {out_path}")
 
         # Generate comparison plot
         comparison_path = os.path.join(seed_dir, "comparison.png")
-        models_dict = {
-            "Softmax": softmax_model,
-            "Simplex LDA": simplex_model,
-            "Trainable LDA": trainable_model,
+        models_dict = {}
+        name_map = {
+            "softmax": "Softmax",
+            "simplex_lda": "Simplex LDA",
+            "trainable_lda": "Trainable LDA",
+            "trainable_lda_spherical": "Trainable LDA (Spherical)",
         }
+        for model_name, model in trained_models.items():
+            models_dict[name_map.get(model_name, model_name)] = model
 
         # Define sample getter based on dataset type
         if args.dataset in hyperspectral_datasets:
@@ -544,6 +550,11 @@ def main():
                         choices=["IndianPines", "Salinas", "LoveDA"],
                         help="Dataset to use")
     
+    # Model selection
+    all_models = ["softmax", "simplex_lda", "trainable_lda", "trainable_lda_spherical"]
+    parser.add_argument("--models", type=str, nargs="*", default=None, choices=all_models,
+                        help="Models to train (default: all)")
+    
     # Data paths
     parser.add_argument("--data-dir", type=str, default="./data",
                         help="Path to data directory containing .mat files")
@@ -554,7 +565,7 @@ def main():
     # Training params
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seeds", type=int, nargs="*", default=[42, 123, 456])
     parser.add_argument("--base-channels", type=int, default=32)

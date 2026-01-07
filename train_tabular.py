@@ -2,7 +2,7 @@
 Tabular classification experiments with LDA heads.
 
 Usage:
-    python train_tabular.py --data ./datasets/LU22_tabular.csv --epochs 30 --seeds 42 123 456
+    python train_tabular.py --data ./datasets/LU22_tabular.csv --epochs 30 --seeds 42 123 456 --dnll-lambda 1.0
     python train_tabular.py --plot-only --results-root ./runs/tabular
 """
 import os
@@ -19,7 +19,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
 from src.lda import DNLLLoss
-from models import SoftmaxTabular, SimplexLDATabular, TrainableLDATabular
+from models import SoftmaxTabular, SimplexLDATabular, TrainableLDATabular, TrainableLDASphericalTabular
 from utils import (
     seed_all,
     save_json,
@@ -80,9 +80,16 @@ def load_tabular_data(data_path: str, label_col: str, test_size: float = 0.2, se
 # ==============================================================================
 # Main Experiment
 # ==============================================================================
+ALL_MODELS = ["softmax", "simplex_lda", "trainable_lda", "trainable_lda_spherical"]
+
+
 def run_experiment(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    # Select models to train
+    models_to_train = args.models if args.models else ALL_MODELS
+    print(f"Models to train: {models_to_train}")
 
     results_root = os.path.abspath(args.results_root)
     os.makedirs(results_root, exist_ok=True)
@@ -94,9 +101,14 @@ def run_experiment(args):
         os.makedirs(seed_dir, exist_ok=True)
         out_path = os.path.join(seed_dir, "acc_history.json")
 
-        if os.path.exists(out_path) and not args.overwrite:
-            print(f"Skipping {dataset_name} seed={seed} (cached)")
-            continue
+        # Load existing history if exists
+        if os.path.exists(out_path):
+            import json
+            with open(out_path) as f:
+                existing_data = json.load(f)
+            hist = existing_data.get("history", {})
+        else:
+            hist = {}
 
         print(f"\n=== {dataset_name} | seed={seed} ===")
         seed_all(seed)
@@ -118,70 +130,77 @@ def run_experiment(args):
 
         print(f"Classes: {C}, Features: {input_dim}, Train: {len(train_ds)}, Test: {len(test_ds)}")
 
-        # Build models
-        softmax_model = SoftmaxTabular(input_dim, C, D, args.hidden_dims, args.dropout).to(device)
-        simplex_model = SimplexLDATabular(input_dim, C, D, args.hidden_dims, args.dropout).to(device)
-        trainable_model = TrainableLDATabular(input_dim, C, D, args.hidden_dims, args.dropout).to(device)
-
-        opt_soft = torch.optim.Adam(softmax_model.parameters(), lr=args.lr)
-        opt_simp = torch.optim.Adam(simplex_model.parameters(), lr=args.lr)
-        opt_trn = torch.optim.Adam(trainable_model.parameters(), lr=args.lr)
-
         ce_loss = nn.CrossEntropyLoss().to(device)
-        dnll_loss = DNLLLoss(lambda_reg=1.0).to(device)
+        dnll_loss = DNLLLoss(lambda_reg=args.dnll_lambda).to(device)
 
-        hist = {
-            "softmax": {"train_acc": [], "test_acc": []},
-            "simplex_lda": {"train_acc": [], "test_acc": []},
-            "trainable_lda": {"train_acc": [], "test_acc": []},
+        # Model configs: (class, loss_fn)
+        model_configs = {
+            "softmax": (SoftmaxTabular, ce_loss),
+            "simplex_lda": (SimplexLDATabular, dnll_loss),
+            "trainable_lda": (TrainableLDATabular, dnll_loss),
+            "trainable_lda_spherical": (TrainableLDASphericalTabular, dnll_loss),
         }
 
-        for epoch in range(1, args.epochs + 1):
-            tr_soft = train_classification_epoch(softmax_model, train_loader, opt_soft, ce_loss, device)
-            te_soft = evaluate_classification(softmax_model, test_loader, device)
+        models_dir = os.path.join(seed_dir, "models")
+        os.makedirs(models_dir, exist_ok=True)
 
-            tr_simp = train_classification_epoch(simplex_model, train_loader, opt_simp, dnll_loss, device)
-            te_simp = evaluate_classification(simplex_model, test_loader, device)
+        trained_models = {}
+        for model_name in models_to_train:
+            if model_name not in model_configs:
+                print(f"Unknown model: {model_name}")
+                continue
 
-            tr_trn = train_classification_epoch(trainable_model, train_loader, opt_trn, dnll_loss, device)
-            te_trn = evaluate_classification(trainable_model, test_loader, device)
+            # Skip if already trained and not overwriting
+            if model_name in hist and not args.overwrite:
+                print(f"  Skipping {model_name} (cached)")
+                continue
 
-            hist["softmax"]["train_acc"].append(tr_soft)
-            hist["softmax"]["test_acc"].append(te_soft)
-            hist["simplex_lda"]["train_acc"].append(tr_simp)
-            hist["simplex_lda"]["test_acc"].append(te_simp)
-            hist["trainable_lda"]["train_acc"].append(tr_trn)
-            hist["trainable_lda"]["test_acc"].append(te_trn)
+            model_cls, loss_fn = model_configs[model_name]
+            model = model_cls(input_dim, C, D, args.hidden_dims, args.dropout).to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-            print(
-                f"[Epoch {epoch:02d}] "
-                f"Softmax tr={tr_soft:.3f} te={te_soft:.3f} | "
-                f"Simplex tr={tr_simp:.3f} te={te_simp:.3f} | "
-                f"Trainable tr={tr_trn:.3f} te={te_trn:.3f}"
-            )
+            hist[model_name] = {"train_acc": [], "test_acc": []}
+
+            for epoch in range(1, args.epochs + 1):
+                tr_acc = train_classification_epoch(model, train_loader, optimizer, loss_fn, device)
+                te_acc = evaluate_classification(model, test_loader, device)
+                hist[model_name]["train_acc"].append(tr_acc)
+                hist[model_name]["test_acc"].append(te_acc)
+
+                if epoch % 10 == 0 or epoch == args.epochs:
+                    print(f"  [{model_name}] Epoch {epoch:02d}: train={tr_acc:.3f} test={te_acc:.3f}")
+
+            # Save model
+            torch.save(model.state_dict(), os.path.join(models_dir, f"{model_name}.pt"))
+            trained_models[model_name] = model
 
         save_json(out_path, {
             "seed": seed,
             "epochs": args.epochs,
             "history": hist,
             "dataset": dataset_name,
+            "dnll_lambda": args.dnll_lambda,
             "timestamp": time.time(),
         })
         print(f"Saved {out_path}")
 
-        # Save models for embedding plots
-        models_dir = os.path.join(seed_dir, "models")
-        os.makedirs(models_dir, exist_ok=True)
-        torch.save(softmax_model.state_dict(), os.path.join(models_dir, "softmax.pt"))
-        torch.save(simplex_model.state_dict(), os.path.join(models_dir, "simplex_lda.pt"))
-        torch.save(trainable_model.state_dict(), os.path.join(models_dir, "trainable_lda.pt"))
-
-        # Plot embeddings for this seed
-        plot_tabular_embeddings(
-            {"Softmax": softmax_model, "Simplex LDA": simplex_model, "Trainable LDA": trainable_model},
-            train_loader, C, device,
-            save_path=os.path.join(seed_dir, "embeddings.png")
-        )
+        # Plot embeddings for this seed - load ALL saved models for complete plot
+        name_map = {"softmax": "Softmax", "simplex_lda": "Simplex LDA", 
+                   "trainable_lda": "Trainable LDA", "trainable_lda_spherical": "Trainable LDA (Sph)"}
+        plot_models = {}
+        for model_name in ALL_MODELS:
+            model_path = os.path.join(models_dir, f"{model_name}.pt")
+            if os.path.exists(model_path):
+                model_cls, _ = model_configs[model_name]
+                model = model_cls(input_dim, C, D, args.hidden_dims, args.dropout).to(device)
+                model.load_state_dict(torch.load(model_path, map_location=device))
+                plot_models[name_map.get(model_name, model_name)] = model
+        
+        if plot_models:
+            plot_tabular_embeddings(
+                plot_models, train_loader, C, device,
+                save_path=os.path.join(seed_dir, "embeddings.png")
+            )
 
     # Plot results
     print("\nGenerating plots...")
@@ -193,16 +212,20 @@ def main():
     parser.add_argument("--data", type=str, default="data/LU22_tabular.csv", help="Path to CSV data file")
     parser.add_argument("--label-col", type=str, default="Label_clas", help="Label column name")
     parser.add_argument("--results-root", type=str, default="./runs/tabular", help="Output directory")
+    parser.add_argument("--models", type=str, nargs="*", default=None, choices=ALL_MODELS,
+                        help="Models to train (default: all)")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--test-size", type=float, default=0.2, help="Fraction of data for testing")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--hidden-dims", type=int, nargs="*", default=[512, 256, 128])
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--seeds", type=int, nargs="*", default=[42, 123, 456])
     parser.add_argument("--overwrite", action="store_true", help="Overwrite cached runs")
     parser.add_argument("--plot-only", action="store_true", help="Only generate plots from existing results")
+    parser.add_argument("--dnll-lambda", dest="dnll_lambda", type=float, default=1.0,
+                        help="DNLL loss lambda regularization strength (default: 1.0)")
 
     args = parser.parse_args()
 

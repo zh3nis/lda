@@ -67,12 +67,25 @@ class SimplexLDATabular(nn.Module):
 
 
 class TrainableLDATabular(nn.Module):
-    """LDA classifier with trainable class means and covariance for tabular data."""
+    """LDA classifier with trainable class means and full covariance for tabular data."""
 
     def __init__(self, input_dim: int, num_classes: int, dim: int, hidden_dims=None, dropout=0.3):
         super().__init__()
         self.encoder = MLPEncoder(input_dim, dim, hidden_dims, dropout)
         self.head = TrainableLDAHead(num_classes, dim, cov_type="full")
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.head(z)
+
+
+class TrainableLDASphericalTabular(nn.Module):
+    """LDA classifier with trainable class means and spherical covariance for tabular data."""
+
+    def __init__(self, input_dim: int, num_classes: int, dim: int, hidden_dims=None, dropout=0.3):
+        super().__init__()
+        self.encoder = MLPEncoder(input_dim, dim, hidden_dims, dropout)
+        self.head = TrainableLDAHead(num_classes, dim, cov_type="spherical")
 
     def forward(self, x):
         z = self.encoder(x)
@@ -138,12 +151,25 @@ class SimplexLDAClassifier(nn.Module):
 
 
 class TrainableLDAClassifier(nn.Module):
-    """LDA classifier with trainable class means and covariance."""
+    """LDA classifier with trainable class means and full covariance."""
 
     def __init__(self, in_channels: int, num_classes: int, dim: int):
         super().__init__()
         self.encoder = Encoder(in_channels, dim)
         self.head = TrainableLDAHead(num_classes, dim, cov_type="full")
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.head(z)
+
+
+class TrainableLDASphericalClassifier(nn.Module):
+    """LDA classifier with trainable class means and spherical covariance."""
+
+    def __init__(self, in_channels: int, num_classes: int, dim: int):
+        super().__init__()
+        self.encoder = Encoder(in_channels, dim)
+        self.head = TrainableLDAHead(num_classes, dim, cov_type="spherical")
 
     def forward(self, x):
         z = self.encoder(x)
@@ -271,7 +297,7 @@ class SimplexLDASegmentation(nn.Module):
 
 
 class TrainableLDASegmentation(nn.Module):
-    """LDA segmentation model with trainable class means and covariance."""
+    """LDA segmentation model with trainable class means and full covariance."""
 
     def __init__(self, in_ch: int, num_classes: int, base_ch: int = 32):
         super().__init__()
@@ -280,6 +306,27 @@ class TrainableLDASegmentation(nn.Module):
         self.dim = num_classes - 1
         self.proj = nn.Conv2d(self.encoder.out_channels, self.dim, kernel_size=1)
         self.lda_head = TrainableLDAHead(num_classes, self.dim, cov_type="full")
+
+    def forward(self, x):
+        z = self.encoder(x)
+        z_embed = self.proj(z)
+        b, d, h, w = z_embed.shape
+        z_flat = z_embed.permute(0, 2, 3, 1).reshape(b * h * w, d)
+        logits_flat = self.lda_head(z_flat)
+        logits = logits_flat.view(b, h, w, self.num_classes).permute(0, 3, 1, 2)
+        return logits
+
+
+class TrainableLDASphericalSegmentation(nn.Module):
+    """LDA segmentation model with trainable class means and spherical covariance."""
+
+    def __init__(self, in_ch: int, num_classes: int, base_ch: int = 32):
+        super().__init__()
+        self.encoder = UNetEncoder(in_ch, base_ch)
+        self.num_classes = num_classes
+        self.dim = num_classes - 1
+        self.proj = nn.Conv2d(self.encoder.out_channels, self.dim, kernel_size=1)
+        self.lda_head = TrainableLDAHead(num_classes, self.dim, cov_type="spherical")
 
     def forward(self, x):
         z = self.encoder(x)
@@ -328,7 +375,7 @@ class SimplexLDAFCNSegmentation(nn.Module):
 
 
 class TrainableLDAFCNSegmentation(nn.Module):
-    """Simple FCN segmentation with trainable LDA head."""
+    """Simple FCN segmentation with trainable LDA head (full covariance)."""
 
     def __init__(self, in_ch: int, num_classes: int, base_ch: int = 32):
         super().__init__()
@@ -337,6 +384,27 @@ class TrainableLDAFCNSegmentation(nn.Module):
         self.dim = num_classes - 1
         self.proj = nn.Conv2d(self.encoder.out_channels, self.dim, kernel_size=1)
         self.lda_head = TrainableLDAHead(num_classes, self.dim, cov_type="full")
+
+    def forward(self, x):
+        z = self.encoder(x)
+        z_embed = self.proj(z)
+        b, d, h, w = z_embed.shape
+        z_flat = z_embed.permute(0, 2, 3, 1).reshape(b * h * w, d)
+        logits_flat = self.lda_head(z_flat)
+        logits = logits_flat.view(b, h, w, self.num_classes).permute(0, 3, 1, 2)
+        return logits
+
+
+class TrainableLDASphericalFCNSegmentation(nn.Module):
+    """Simple FCN segmentation with trainable LDA head (spherical covariance)."""
+
+    def __init__(self, in_ch: int, num_classes: int, base_ch: int = 32):
+        super().__init__()
+        self.encoder = SimpleFCNEncoder(in_ch, base_ch)
+        self.num_classes = num_classes
+        self.dim = num_classes - 1
+        self.proj = nn.Conv2d(self.encoder.out_channels, self.dim, kernel_size=1)
+        self.lda_head = TrainableLDAHead(num_classes, self.dim, cov_type="spherical")
 
     def forward(self, x):
         z = self.encoder(x)

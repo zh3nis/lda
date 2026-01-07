@@ -255,7 +255,9 @@ def plot_calibration_all_datasets(all_results, save_path):
     """
     from matplotlib.patches import Patch
     
-    datasets = list(all_results.keys())
+    # Fixed order: EuroSAT, UCMerced, RESISC45
+    dataset_order = ["EuroSAT", "UCMerced", "RESISC45"]
+    datasets = [d for d in dataset_order if d in all_results]
     models = list(all_results[datasets[0]].keys())
     n_datasets = len(datasets)
     n_models = len(models)
@@ -278,7 +280,7 @@ def plot_calibration_all_datasets(all_results, save_path):
             
             # ---- Confidence histogram (even rows: 0, 2, 4) ----
             ax = axes[d_idx * 2, m_idx]
-            ax.hist(confidences, bins=bin_edges, density=True, alpha=0.7, color="blue", edgecolor="black")
+            ax.hist(confidences, bins=bin_edges, density=True, alpha=0.7, color="mediumpurple", edgecolor="black", linewidth=0.5)
             
             avg_acc = accuracies.mean()
             avg_conf = confidences.mean()
@@ -291,7 +293,7 @@ def plot_calibration_all_datasets(all_results, save_path):
             
             # Title only on first row
             if d_idx == 0:
-                ax.set_title(model_name, fontsize=11, fontweight="bold")
+                ax.set_title(model_name, fontsize=11)
             
             # Dataset label on left
             if m_idx == 0:
@@ -306,14 +308,14 @@ def plot_calibration_all_datasets(all_results, save_path):
             # ---- Reliability diagram (odd rows: 1, 3, 5) ----
             ax = axes[d_idx * 2 + 1, m_idx]
             
-            ax.bar(bin_centers, cal["bin_accs"], width=bin_width * 0.9, 
-                   alpha=0.7, color="blue", edgecolor="black")
+            ax.bar(bin_centers, cal["bin_accs"], width=bin_width, 
+                   alpha=0.7, color="steelblue", edgecolor="black", linewidth=0.5)
             
             gaps = cal["bin_confs"] - cal["bin_accs"]
             for j, (center, acc, gap) in enumerate(zip(bin_centers, cal["bin_accs"], gaps)):
                 if gap > 0 and cal["bin_counts"][j] > 0:
-                    ax.bar(center, gap, bottom=acc, width=bin_width * 0.9,
-                           alpha=0.3, color="red", edgecolor="red", hatch="//")
+                    ax.bar(center, gap, bottom=acc, width=bin_width,
+                           alpha=0.4, color="salmon", edgecolor="darkred", linewidth=0.5, hatch="//")
             
             ax.plot([0, 1], [0, 1], "k--", linewidth=1, alpha=0.7)
             
@@ -341,16 +343,15 @@ def plot_calibration_all_datasets(all_results, save_path):
     
     # Add legend at the bottom
     legend_elements = [
-        Patch(facecolor="blue", alpha=0.7, edgecolor="black", label="Accuracy"),
-        Patch(facecolor="red", alpha=0.3, edgecolor="red", hatch="//", label="Gap (overconfident)"),
+        Patch(facecolor="steelblue", alpha=0.7, edgecolor="black", label="Accuracy"),
+        Patch(facecolor="salmon", alpha=0.4, edgecolor="darkred", hatch="//", label="Gap (overconfident)"),
         plt.Line2D([0], [0], color="gray", linestyle="--", linewidth=1.5, label="Accuracy"),
         plt.Line2D([0], [0], color="gray", linestyle=":", linewidth=1.5, label="Avg. confidence"),
     ]
     fig.legend(handles=legend_elements, loc="lower center", ncol=4, fontsize=9, 
-               bbox_to_anchor=(0.5, -0.02))
+               bbox_to_anchor=(0.5, 0.0))
     
-    plt.tight_layout()
-    plt.subplots_adjust(bottom=0.08)
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -360,11 +361,24 @@ def plot_calibration_all_datasets(all_results, save_path):
 # ==============================================================================
 # Main
 # ==============================================================================
+def get_available_seeds(dataset_name):
+    """Find all available seeds with trained models."""
+    base_dir = f"./runs/classification/{dataset_name}"
+    seeds = []
+    if os.path.exists(base_dir):
+        for d in os.listdir(base_dir):
+            if d.startswith("seed_"):
+                seed = int(d.split("_")[1])
+                model_path = os.path.join(base_dir, d, "models", "softmax.pth")
+                if os.path.exists(model_path):
+                    seeds.append(seed)
+    return sorted(seeds)
+
+
 def run_single_dataset(dataset_name, data_root, seed, device):
-    """Run calibration for a single dataset."""
+    """Run calibration for a single dataset and seed."""
     test_loader, num_classes, in_channels = get_test_loader(data_root, dataset_name)
     D = num_classes - 1
-    print(f"{dataset_name}: {num_classes} classes, {in_channels} channels")
 
     models_dir = os.path.join(f"./runs/classification/{dataset_name}", f"seed_{seed}", "models")
     
@@ -391,9 +405,52 @@ def run_single_dataset(dataset_name, data_root, seed, device):
             "calibration": calibration,
         }
 
-        print(f"  {name}: Accuracy={accuracies.mean()*100:.1f}%, ECE={calibration['ece']:.1f}%")
+    return results, num_classes, in_channels
 
-    return results
+
+def run_dataset_averaged(dataset_name, data_root, device):
+    """Run calibration for a dataset, averaged across all available seeds."""
+    seeds = get_available_seeds(dataset_name)
+    print(f"{dataset_name}: Found seeds {seeds}")
+    
+    if not seeds:
+        raise ValueError(f"No trained models found for {dataset_name}")
+    
+    all_seed_results = []
+    for seed in seeds:
+        results, _, _ = run_single_dataset(dataset_name, data_root, seed, device)
+        all_seed_results.append(results)
+    
+    # Average results across seeds
+    models = list(all_seed_results[0].keys())
+    averaged_results = {}
+    
+    for model_name in models:
+        # Collect across seeds
+        all_confidences = np.concatenate([r[model_name]["confidences"] for r in all_seed_results])
+        all_accuracies = np.concatenate([r[model_name]["accuracies"] for r in all_seed_results])
+        
+        # Average ECE and bin stats
+        avg_ece = np.mean([r[model_name]["calibration"]["ece"] for r in all_seed_results])
+        avg_bin_accs = np.mean([r[model_name]["calibration"]["bin_accs"] for r in all_seed_results], axis=0)
+        avg_bin_confs = np.mean([r[model_name]["calibration"]["bin_confs"] for r in all_seed_results], axis=0)
+        avg_bin_counts = np.mean([r[model_name]["calibration"]["bin_counts"] for r in all_seed_results], axis=0)
+        bin_edges = all_seed_results[0][model_name]["calibration"]["bin_edges"]
+        
+        averaged_results[model_name] = {
+            "confidences": all_confidences,
+            "accuracies": all_accuracies,
+            "calibration": {
+                "ece": avg_ece,
+                "bin_accs": avg_bin_accs,
+                "bin_confs": avg_bin_confs,
+                "bin_counts": avg_bin_counts,
+                "bin_edges": bin_edges,
+            },
+        }
+        print(f"  {model_name}: Avg Accuracy={all_accuracies.mean()*100:.1f}%, Avg ECE={avg_ece:.1f}%")
+    
+    return averaged_results
 
 
 def main():
@@ -401,7 +458,7 @@ def main():
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--dataset", type=str, default="RESISC45", choices=list(DATASETS.keys()) + ["all"],
                         help="Dataset to use (or 'all' for combined plot)")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None, help="Specific seed (default: average all available)")
     parser.add_argument("--output-dir", type=str, default="./plots")
     args = parser.parse_args()
 
@@ -413,15 +470,21 @@ def main():
         all_results = {}
         for dataset_name in DATASETS.keys():
             print(f"\n=== {dataset_name} ===")
-            all_results[dataset_name] = run_single_dataset(
-                dataset_name, args.data_root, args.seed, device
-            )
+            if args.seed is not None:
+                results, _, _ = run_single_dataset(dataset_name, args.data_root, args.seed, device)
+                all_results[dataset_name] = results
+            else:
+                all_results[dataset_name] = run_dataset_averaged(dataset_name, args.data_root, device)
         
         save_path = os.path.join(args.output_dir, "all_calibration.png")
         plot_calibration_all_datasets(all_results, save_path)
     else:
         # Single dataset
-        results = run_single_dataset(args.dataset, args.data_root, args.seed, device)
+        if args.seed is not None:
+            results, _, _ = run_single_dataset(args.dataset, args.data_root, args.seed, device)
+        else:
+            print(f"\n=== {args.dataset} ===")
+            results = run_dataset_averaged(args.dataset, args.data_root, device)
         save_path = os.path.join(args.output_dir, f"{args.dataset.lower()}_calibration.png")
         plot_calibration(results, save_path, args.dataset)
 

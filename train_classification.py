@@ -20,7 +20,10 @@ import torchvision.transforms as T
 from torchgeo.datasets import EuroSAT, RESISC45, UCMerced
 
 from src.lda import DNLLLoss
-from models import SoftmaxClassifier, SimplexLDAClassifier, TrainableLDAClassifier
+from models import (
+    SoftmaxClassifier, SimplexLDAClassifier, TrainableLDAClassifier,
+    TrainableLDASphericalClassifier,
+)
 from utils import (
     seed_all,
     save_json,
@@ -150,9 +153,16 @@ def make_dataloaders(
 # ==============================================================================
 # Main Experiment
 # ==============================================================================
+ALL_MODELS = ["softmax", "simplex_lda", "trainable_lda", "trainable_lda_spherical"]
+
+
 def run_experiment(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    # Select models to train
+    models_to_train = args.models if args.models else ALL_MODELS
+    print(f"Models to train: {models_to_train}")
 
     # Prepare dataloaders for selected datasets
     if args.dataset:
@@ -190,57 +200,61 @@ def run_experiment(args):
             os.makedirs(seed_dir, exist_ok=True)
             out_path = os.path.join(seed_dir, "acc_history.json")
 
-            if os.path.exists(out_path) and not args.overwrite:
-                print(f"Skipping {name} seed={seed} (cached)")
-                continue
+            # Load existing history if exists
+            if os.path.exists(out_path):
+                import json
+                with open(out_path) as f:
+                    existing_data = json.load(f)
+                hist = existing_data.get("history", {})
+            else:
+                hist = {}
 
             print(f"\n=== {name} | seed={seed} ===")
             seed_all(seed)
 
-            # Build models
-            softmax_model = SoftmaxClassifier(in_ch, C, D).to(device)
-            simplex_model = SimplexLDAClassifier(in_ch, C, D).to(device)
-            trainable_model = TrainableLDAClassifier(in_ch, C, D).to(device)
-
-            opt_soft = torch.optim.Adam(softmax_model.parameters(), lr=args.lr)
-            opt_simp = torch.optim.Adam(simplex_model.parameters(), lr=args.lr)
-            opt_trn = torch.optim.Adam(trainable_model.parameters(), lr=args.lr)
-
             ce_loss = nn.CrossEntropyLoss().to(device)
             dnll_loss = DNLLLoss(lambda_reg=1.0).to(device)
 
-            hist = {
-                "softmax": {"train_acc": [], "test_acc": []},
-                "simplex_lda": {"train_acc": [], "test_acc": []},
-                "trainable_lda": {"train_acc": [], "test_acc": []},
+            # Model configs: (name, class, loss_fn)
+            model_configs = {
+                "softmax": (SoftmaxClassifier, ce_loss),
+                "simplex_lda": (SimplexLDAClassifier, dnll_loss),
+                "trainable_lda": (TrainableLDAClassifier, dnll_loss),
+                "trainable_lda_spherical": (TrainableLDASphericalClassifier, dnll_loss),
             }
 
-            for epoch in range(1, args.epochs + 1):
-                # Train all models
-                tr_soft = train_classification_epoch(softmax_model, train_loader, opt_soft, ce_loss, device)
-                te_soft = evaluate_classification(softmax_model, test_loader, device)
+            models_dir = os.path.join(seed_dir, "models")
+            os.makedirs(models_dir, exist_ok=True)
 
-                tr_simp = train_classification_epoch(simplex_model, train_loader, opt_simp, dnll_loss, device)
-                te_simp = evaluate_classification(simplex_model, test_loader, device)
+            for model_name in models_to_train:
+                if model_name not in model_configs:
+                    print(f"Unknown model: {model_name}")
+                    continue
 
-                tr_trn = train_classification_epoch(trainable_model, train_loader, opt_trn, dnll_loss, device)
-                te_trn = evaluate_classification(trainable_model, test_loader, device)
+                # Skip if already trained and not overwriting
+                if model_name in hist and not args.overwrite:
+                    print(f"  Skipping {model_name} (cached)")
+                    continue
 
-                # Record history
-                hist["softmax"]["train_acc"].append(tr_soft)
-                hist["softmax"]["test_acc"].append(te_soft)
-                hist["simplex_lda"]["train_acc"].append(tr_simp)
-                hist["simplex_lda"]["test_acc"].append(te_simp)
-                hist["trainable_lda"]["train_acc"].append(tr_trn)
-                hist["trainable_lda"]["test_acc"].append(te_trn)
+                model_cls, loss_fn = model_configs[model_name]
+                model = model_cls(in_ch, C, D).to(device)
+                optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-                print(
-                    f"[Epoch {epoch:02d}] "
-                    f"Softmax tr={tr_soft:.3f} te={te_soft:.3f} | "
-                    f"Simplex tr={tr_simp:.3f} te={te_simp:.3f} | "
-                    f"Trainable tr={tr_trn:.3f} te={te_trn:.3f}"
-                )
+                hist[model_name] = {"train_acc": [], "test_acc": []}
 
+                for epoch in range(1, args.epochs + 1):
+                    tr_acc = train_classification_epoch(model, train_loader, optimizer, loss_fn, device)
+                    te_acc = evaluate_classification(model, test_loader, device)
+                    hist[model_name]["train_acc"].append(tr_acc)
+                    hist[model_name]["test_acc"].append(te_acc)
+
+                    if epoch % 10 == 0 or epoch == args.epochs:
+                        print(f"  [{model_name}] Epoch {epoch:02d}: train={tr_acc:.3f} test={te_acc:.3f}")
+
+                # Save model
+                torch.save(model.state_dict(), os.path.join(models_dir, f"{model_name}.pth"))
+
+            # Save history
             save_json(out_path, {
                 "seed": seed,
                 "epochs": args.epochs,
@@ -249,14 +263,6 @@ def run_experiment(args):
                 "timestamp": time.time(),
             })
             print(f"Saved {out_path}")
-
-            # Save models
-            models_dir = os.path.join(seed_dir, "models")
-            os.makedirs(models_dir, exist_ok=True)
-            torch.save(softmax_model.state_dict(), os.path.join(models_dir, "softmax.pth"))
-            torch.save(simplex_model.state_dict(), os.path.join(models_dir, "simplex_lda.pth"))
-            torch.save(trainable_model.state_dict(), os.path.join(models_dir, "trainable_lda.pth"))
-            print(f"Saved models to {models_dir}")
 
     # Plot results
     print("\nGenerating plots...")
@@ -269,8 +275,10 @@ def main():
     parser.add_argument("--results-root", type=str, default="./runs/classification", help="Output directory")
     parser.add_argument("--dataset", type=str, default=None, choices=list(DATASETS.keys()),
                         help="Dataset to use (default: all)")
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=16)
+    parser.add_argument("--models", type=str, nargs="*", default=None, choices=ALL_MODELS,
+                        help="Models to train (default: all)")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--train-frac", type=float, default=0.8, help="Fraction of data for training")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
