@@ -250,8 +250,8 @@ class FullCovLDAHead(nn.Module):
         self.D = D
         self.min_scale = min_scale
         dtype = torch.get_default_dtype()
-        #self.mu = nn.Parameter(torch.zeros(C, D, dtype=dtype))
-        self.mu = nn.Parameter(torch.randn(C, D, dtype=dtype) * 6.0 / math.sqrt(2*D))
+        self.mu = nn.Parameter(torch.zeros(C, D, dtype=dtype))
+        #self.mu = nn.Parameter(torch.randn(C, D, dtype=dtype) * 6.0 / math.sqrt(2*D))
         self.raw_tril = nn.Parameter(torch.zeros(D, D, dtype=dtype))
         self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
 
