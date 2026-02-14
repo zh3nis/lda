@@ -83,6 +83,48 @@ class TrainableLDAHead(nn.Module):
 
 
 
+class FullCovarianceLDAHead(nn.Module):
+    """LDA classifier with fully trainable means, shared covariance matrix, and priors."""
+
+    def __init__(self, C, D):
+        super().__init__()
+        self.C = C
+        self.D = D
+        dtype = torch.get_default_dtype()
+        self.mu = nn.Parameter(torch.zeros(C, D, dtype=dtype))
+        self.prior_logits = nn.Parameter(torch.zeros(C, dtype=dtype))
+        self.cov_factor = nn.Parameter(torch.eye(D, dtype=dtype))
+
+    def _covariance_factor(self):
+        """Return a lower-triangular Cholesky factor with positive diagonal."""
+        L = torch.tril(self.cov_factor)
+        diag = torch.diagonal(L, dim1=-2, dim2=-1)
+        diag_pos = torch.exp(diag)
+        L = L - torch.diag_embed(diag) + torch.diag_embed(diag_pos)
+        return L, diag
+
+    def covariance_matrix(self):
+        L, _ = self._covariance_factor()
+        return L @ L.transpose(-1, -2)
+
+    @property
+    def cov_diag(self):
+        return torch.diagonal(self.covariance_matrix(), dim1=-2, dim2=-1)
+
+    def forward(self, z):
+        mu = self.mu.to(z.dtype)
+        diff = z.unsqueeze(1) - mu.unsqueeze(0)
+        L, raw_diag = self._covariance_factor()
+        L = L.to(z.dtype)
+        raw_diag = raw_diag.to(z.dtype)
+        inv_cov = torch.cholesky_inverse(L)
+        m2 = torch.sum(diff.matmul(inv_cov) * diff, dim=-1)
+        log_det = 2.0 * raw_diag.sum()
+        log_prior = torch.log_softmax(self.prior_logits, dim=0).to(z.dtype)
+        return log_prior.unsqueeze(0) - 0.5 * (m2 + log_det)
+
+
+
 class _GenericLoss(nn.Module):
     def __init__(self, ignore_index=-100, reduction="elementwise_mean"):
         assert reduction in ["elementwise_mean", "sum", "none"]
